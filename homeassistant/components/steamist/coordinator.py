@@ -13,6 +13,8 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
 _LOGGER = logging.getLogger(__name__)
 
+type SteamistConfigEntry = ConfigEntry[SteamistDataUpdateCoordinator]
+
 
 class SteamistDataUpdateCoordinator(DataUpdateCoordinator[SteamistStatus]):
     """DataUpdateCoordinator to gather data from a steamist steam shower."""
