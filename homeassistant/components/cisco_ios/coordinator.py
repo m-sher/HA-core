@@ -9,6 +9,7 @@ from pexpect import pxssh
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_HOST, CONF_PASSWORD, CONF_PORT, CONF_USERNAME
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers.device_registry import format_mac
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .const import DOMAIN
@@ -62,12 +63,12 @@ def get_cisco_arp_data(
 
 def get_cisco_devices(
     host: str, username: str, password: str, port: int | None = None
-) -> list[str] | None:
-    """Retrieve recently seen devices from Cisco IOS ARP table."""
+) -> dict[str, None] | None:
+    """Retrieve recently seen devices from Cisco IOS ARP table, keyed by MAC."""
     if not (string_result := get_cisco_arp_data(host, username, password, port)):
         return None
 
-    last_results: list[str] = []
+    last_results: dict[str, None] = {}
     lines_result = string_result.splitlines()[2:]
 
     for line in lines_result:
@@ -79,15 +80,15 @@ def get_cisco_devices(
         hw_addr = parts[3]
 
         if age != "-":
-            mac = _parse_cisco_mac_address(hw_addr)
+            mac = format_mac(_parse_cisco_mac_address(hw_addr))
             age_int = int(age)
             if age_int < 1:
-                last_results.append(mac)
+                last_results[mac] = None
 
     return last_results
 
 
-class CiscoIOSDataUpdateCoordinator(DataUpdateCoordinator[list[str]]):
+class CiscoIOSDataUpdateCoordinator(DataUpdateCoordinator[dict[str, None]]):
     """Class to manage fetching data from Cisco IOS."""
 
     config_entry: CiscoIOSConfigEntry
@@ -107,7 +108,7 @@ class CiscoIOSDataUpdateCoordinator(DataUpdateCoordinator[list[str]]):
         )
 
     @override
-    async def _async_update_data(self) -> list[str]:
+    async def _async_update_data(self) -> dict[str, None]:
         """Fetch connected devices from Cisco IOS."""
         if (
             devices := await self.hass.async_add_executor_job(

@@ -114,7 +114,6 @@ class CiscoIOSScannerEntity(
         """Initialize the tracked device."""
         super().__init__(coordinator)
         self._mac = mac
-        self._attr_name = mac
 
     @property
     @override
@@ -126,4 +125,10 @@ class CiscoIOSScannerEntity(
     @override
     def mac_address(self) -> str:
         """Return the MAC address of the device."""
+        return self._mac
+
+    @property
+    @override
+    def name(self) -> str | None:
+        """Return the friendly name of the device."""
         return self._mac
