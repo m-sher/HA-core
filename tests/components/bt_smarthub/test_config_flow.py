@@ -15,7 +15,7 @@ from tests.common import MockConfigEntry
 async def test_user_flow_success(
     hass: HomeAssistant,
     mock_setup_entry: AsyncMock,
-    mock_get_bt_smarthub_data: MagicMock,
+    mock_btsmarthub: MagicMock,
 ) -> None:
     """Test a successful user config flow."""
     result = await hass.config_entries.flow.async_init(
@@ -34,10 +34,10 @@ async def test_user_flow_success(
 async def test_user_flow_cannot_connect(
     hass: HomeAssistant,
     mock_setup_entry: AsyncMock,
-    mock_get_bt_smarthub_data: MagicMock,
+    mock_btsmarthub: MagicMock,
 ) -> None:
     """Test the user flow shows an error on connection failure."""
-    mock_get_bt_smarthub_data.return_value = None
+    mock_btsmarthub.return_value.get_devicelist.return_value = None
 
     result = await hass.config_entries.flow.async_init(
         DOMAIN, context={"source": SOURCE_USER}
@@ -52,7 +52,7 @@ async def test_user_flow_cannot_connect(
 async def test_user_flow_already_configured(
     hass: HomeAssistant,
     mock_setup_entry: AsyncMock,
-    mock_get_bt_smarthub_data: MagicMock,
+    mock_btsmarthub: MagicMock,
     mock_config_entry: MockConfigEntry,
 ) -> None:
     """Test the user flow aborts when the host is already configured."""
@@ -71,7 +71,7 @@ async def test_user_flow_already_configured(
 async def test_import_flow(
     hass: HomeAssistant,
     mock_setup_entry: AsyncMock,
-    mock_get_bt_smarthub_data: MagicMock,
+    mock_btsmarthub: MagicMock,
 ) -> None:
     """Test a successful import flow."""
     result = await hass.config_entries.flow.async_init(
@@ -85,7 +85,7 @@ async def test_import_flow(
 async def test_import_flow_already_configured(
     hass: HomeAssistant,
     mock_setup_entry: AsyncMock,
-    mock_get_bt_smarthub_data: MagicMock,
+    mock_btsmarthub: MagicMock,
     mock_config_entry: MockConfigEntry,
 ) -> None:
     """Test the import flow aborts when already configured."""
@@ -101,10 +101,10 @@ async def test_import_flow_already_configured(
 async def test_import_flow_cannot_connect(
     hass: HomeAssistant,
     mock_setup_entry: AsyncMock,
-    mock_get_bt_smarthub_data: MagicMock,
+    mock_btsmarthub: MagicMock,
 ) -> None:
     """Test the import flow aborts on connection failure."""
-    mock_get_bt_smarthub_data.return_value = None
+    mock_btsmarthub.return_value.get_devicelist.return_value = None
 
     result = await hass.config_entries.flow.async_init(
         DOMAIN, context={"source": SOURCE_IMPORT}, data=MOCK_CONFIG

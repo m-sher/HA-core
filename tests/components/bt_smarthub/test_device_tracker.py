@@ -11,7 +11,7 @@ from homeassistant.helpers.entity_registry import EntityRegistry
 from homeassistant.helpers.issue_registry import IssueRegistry
 from homeassistant.setup import async_setup_component
 
-from .conftest import MOCK_CONFIG, MOCK_DEVICES, MOCK_HOST
+from .conftest import MOCK_CONFIG, MOCK_HOST, MOCK_RAW_DEVICES
 
 from tests.common import MockConfigEntry
 
@@ -19,7 +19,7 @@ from tests.common import MockConfigEntry
 async def test_entities_created(
     hass: HomeAssistant,
     mock_config_entry: MockConfigEntry,
-    mock_get_bt_smarthub_data: MagicMock,
+    mock_btsmarthub: MagicMock,
     entity_registry: EntityRegistry,
 ) -> None:
     """Test device tracker entities are created from the coordinator data."""
@@ -41,7 +41,7 @@ async def test_entities_created(
 
 
 async def test_legacy_platform_imports_config_entry(
-    hass: HomeAssistant, mock_get_bt_smarthub_data: MagicMock
+    hass: HomeAssistant, mock_btsmarthub: MagicMock
 ) -> None:
     """Test the legacy device_tracker platform imports a config entry."""
     assert await async_setup_component(
@@ -59,11 +59,11 @@ async def test_legacy_platform_imports_config_entry(
 
 async def test_legacy_platform_creates_issue_on_cannot_connect(
     hass: HomeAssistant,
-    mock_get_bt_smarthub_data: MagicMock,
+    mock_btsmarthub: MagicMock,
     issue_registry: IssueRegistry,
 ) -> None:
     """Test an issue is raised when the legacy YAML import cannot connect."""
-    mock_get_bt_smarthub_data.return_value = None
+    mock_btsmarthub.return_value.get_devicelist.return_value = None
 
     assert await async_setup_component(
         hass,
@@ -81,10 +81,10 @@ async def test_legacy_platform_creates_issue_on_cannot_connect(
 async def test_setup_entry_retries_when_router_unavailable(
     hass: HomeAssistant,
     mock_config_entry: MockConfigEntry,
-    mock_get_bt_smarthub_data: MagicMock,
+    mock_btsmarthub: MagicMock,
 ) -> None:
     """Test the config entry retries when the router returns no data."""
-    mock_get_bt_smarthub_data.return_value = None
+    mock_btsmarthub.return_value.get_devicelist.return_value = None
     mock_config_entry.add_to_hass(hass)
 
     assert not await hass.config_entries.async_setup(mock_config_entry.entry_id)
@@ -95,17 +95,17 @@ async def test_setup_entry_retries_when_router_unavailable(
 
 async def test_legacy_import_clears_stale_cannot_connect_issue(
     hass: HomeAssistant,
-    mock_get_bt_smarthub_data: MagicMock,
+    mock_btsmarthub: MagicMock,
     issue_registry: IssueRegistry,
 ) -> None:
     """Test a successful YAML import removes a stale cannot_connect repair issue."""
-    mock_get_bt_smarthub_data.return_value = None
+    mock_btsmarthub.return_value.get_devicelist.return_value = None
     assert not await async_setup_scanner(hass, MOCK_CONFIG, AsyncMock())
     assert (
         issue_registry.async_get_issue(DOMAIN, "yaml_import_cannot_connect") is not None
     )
 
-    mock_get_bt_smarthub_data.return_value = MOCK_DEVICES
+    mock_btsmarthub.return_value.get_devicelist.return_value = MOCK_RAW_DEVICES
     assert await async_setup_scanner(hass, MOCK_CONFIG, AsyncMock())
     await hass.async_block_till_done()
     assert issue_registry.async_get_issue(DOMAIN, "yaml_import_cannot_connect") is None
