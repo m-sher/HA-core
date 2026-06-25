@@ -1,10 +1,11 @@
-"""Tests for the Tomato device tracker."""
+"""Tests for the Linksys Smart Wi-Fi device tracker."""
 
 from unittest.mock import AsyncMock, MagicMock
 
-from homeassistant.components.tomato.const import DOMAIN
-from homeassistant.components.tomato.device_tracker import async_setup_scanner
+from homeassistant.components.linksys_smart.const import DOMAIN
+from homeassistant.components.linksys_smart.device_tracker import async_setup_scanner
 from homeassistant.config_entries import SOURCE_IMPORT, ConfigEntryState
+from homeassistant.const import CONF_HOST
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_registry import EntityRegistry
 from homeassistant.helpers.issue_registry import IssueRegistry
@@ -18,7 +19,7 @@ from tests.common import MockConfigEntry
 async def test_entities_created(
     hass: HomeAssistant,
     mock_config_entry: MockConfigEntry,
-    mock_get_tomato_data: MagicMock,
+    mock_get_linksys_smart_data: MagicMock,
     entity_registry: EntityRegistry,
 ) -> None:
     """Test device tracker entities are created from the coordinator data."""
@@ -35,18 +36,18 @@ async def test_entities_created(
     assert len(entries) == 2
 
     entity_ids = {entry.entity_id for entry in entries}
-    assert any(eid.startswith("device_tracker.chromecast") for eid in entity_ids)
-    assert any(eid.startswith("device_tracker.wemo") for eid in entity_ids)
+    assert any(eid.startswith("device_tracker.my_phone") for eid in entity_ids)
+    assert any(eid.startswith("device_tracker.my_laptop") for eid in entity_ids)
 
 
 async def test_legacy_platform_imports_config_entry(
-    hass: HomeAssistant, mock_get_tomato_data: MagicMock
+    hass: HomeAssistant, mock_get_linksys_smart_data: MagicMock
 ) -> None:
     """Test the legacy device_tracker platform imports a config entry."""
     assert await async_setup_component(
         hass,
         "device_tracker",
-        {"device_tracker": [{"platform": DOMAIN, **MOCK_CONFIG}]},
+        {"device_tracker": [{"platform": DOMAIN, CONF_HOST: MOCK_HOST}]},
     )
     await hass.async_block_till_done()
 
@@ -58,16 +59,16 @@ async def test_legacy_platform_imports_config_entry(
 
 async def test_legacy_platform_creates_issue_on_cannot_connect(
     hass: HomeAssistant,
-    mock_get_tomato_data: MagicMock,
+    mock_get_linksys_smart_data: MagicMock,
     issue_registry: IssueRegistry,
 ) -> None:
     """Test an issue is raised when the legacy YAML import cannot connect."""
-    mock_get_tomato_data.return_value = None
+    mock_get_linksys_smart_data.return_value = None
 
     assert await async_setup_component(
         hass,
         "device_tracker",
-        {"device_tracker": [{"platform": DOMAIN, **MOCK_CONFIG}]},
+        {"device_tracker": [{"platform": DOMAIN, CONF_HOST: MOCK_HOST}]},
     )
     await hass.async_block_till_done()
 
@@ -80,10 +81,10 @@ async def test_legacy_platform_creates_issue_on_cannot_connect(
 async def test_setup_entry_retries_when_router_unavailable(
     hass: HomeAssistant,
     mock_config_entry: MockConfigEntry,
-    mock_get_tomato_data: MagicMock,
+    mock_get_linksys_smart_data: MagicMock,
 ) -> None:
     """Test the config entry retries when the router returns no data."""
-    mock_get_tomato_data.return_value = None
+    mock_get_linksys_smart_data.return_value = None
     mock_config_entry.add_to_hass(hass)
 
     assert not await hass.config_entries.async_setup(mock_config_entry.entry_id)
@@ -94,17 +95,17 @@ async def test_setup_entry_retries_when_router_unavailable(
 
 async def test_legacy_import_clears_stale_cannot_connect_issue(
     hass: HomeAssistant,
-    mock_get_tomato_data: MagicMock,
+    mock_get_linksys_smart_data: MagicMock,
     issue_registry: IssueRegistry,
 ) -> None:
     """Test a successful YAML import removes a stale cannot_connect repair issue."""
-    mock_get_tomato_data.return_value = None
+    mock_get_linksys_smart_data.return_value = None
     assert not await async_setup_scanner(hass, MOCK_CONFIG, AsyncMock())
     assert (
         issue_registry.async_get_issue(DOMAIN, "yaml_import_cannot_connect") is not None
     )
 
-    mock_get_tomato_data.return_value = MOCK_DEVICES
+    mock_get_linksys_smart_data.return_value = MOCK_DEVICES
     assert await async_setup_scanner(hass, MOCK_CONFIG, AsyncMock())
     await hass.async_block_till_done()
     assert issue_registry.async_get_issue(DOMAIN, "yaml_import_cannot_connect") is None

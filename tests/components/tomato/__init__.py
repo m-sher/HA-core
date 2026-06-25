@@ -1,1 +1,1 @@
-"""Tests for the tomato component."""
+"""Tests for the Tomato integration."""
