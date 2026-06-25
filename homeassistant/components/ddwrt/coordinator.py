@@ -37,7 +37,7 @@ def _parse_ddwrt_response(data_str: str) -> dict[str, str]:
 
 
 def get_ddwrt_data(
-    protocol: str, host: str, username: str, password: str, verify_ssl: bool, url: str
+    username: str, password: str, verify_ssl: bool, url: str
 ) -> dict[str, str] | None:
     """Retrieve data from DD-WRT and return parsed result."""
     try:
@@ -74,7 +74,7 @@ def get_ddwrt_devices(
     endpoint = "Wireless" if wireless_only else "Lan"
     url = f"{protocol}://{host}/Status_{endpoint}.live.asp"
 
-    if not (data := get_ddwrt_data(protocol, host, username, password, verify_ssl, url)):
+    if not (data := get_ddwrt_data(username, password, verify_ssl, url)):
         return None
 
     if wireless_only:
@@ -88,10 +88,9 @@ def get_ddwrt_devices(
     elements = clean_str.split("','")
     macs = [item for item in elements if _MAC_REGEX.match(item)]
 
-    # Fetch device names from DHCP leases
     lan_url = f"{protocol}://{host}/Status_Lan.live.asp"
     mac2name: dict[str, str] = {}
-    if lan_data := get_ddwrt_data(protocol, host, username, password, verify_ssl, lan_url):
+    if lan_data := get_ddwrt_data(username, password, verify_ssl, lan_url):
         if dhcp_leases := lan_data.get("dhcp_leases"):
             cleaned_str = dhcp_leases.replace('"', "").replace("'", "").replace(" ", "")
             lease_elements = cleaned_str.split(",")
