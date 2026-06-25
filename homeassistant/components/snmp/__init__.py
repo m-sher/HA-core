@@ -1,4 +1,11 @@
-"""The SNMP integration."""
+"""The SNMP integration.
+
+Config entries added by this migration are device_tracker-only. The existing
+YAML sensor and switch platforms continue to work independently via platform
+setup and do not use config entries.
+"""
+
+from pysnmp.error import PySnmpError
 
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant
@@ -17,7 +24,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: SnmpConfigEntry) -> bool
     coordinator = SnmpDataUpdateCoordinator(hass, entry)
     try:
         await coordinator.async_setup()
-    except Exception as err:
+    except (PySnmpError, OSError, TimeoutError, ValueError) as err:
         raise ConfigEntryNotReady(f"Failed to set up SNMP: {err}") from err
     await coordinator.async_config_entry_first_refresh()
     entry.runtime_data = coordinator

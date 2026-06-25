@@ -91,11 +91,11 @@ async def async_setup_entry(
     def _async_add_new_devices() -> None:
         """Add newly discovered devices from the coordinator."""
         new_entities: list[ActiontecScannerEntity] = []
-        for device in coordinator.data:
-            if device.mac_address in tracked:
+        for mac in coordinator.data:
+            if mac in tracked:
                 continue
-            tracked.add(device.mac_address)
-            new_entities.append(ActiontecScannerEntity(coordinator, device.mac_address))
+            tracked.add(mac)
+            new_entities.append(ActiontecScannerEntity(coordinator, mac))
         if new_entities:
             async_add_entities(new_entities)
 
@@ -114,26 +114,17 @@ class ActiontecScannerEntity(
         """Initialize the tracked device."""
         super().__init__(coordinator)
         self._mac_address = mac_address
-        if (device := self._device) is not None:
-            self._attr_name = device.ip_address
 
     @property
     def _device(self) -> Device | None:
         """Return the current device data."""
-        return next(
-            (
-                device
-                for device in self.coordinator.data
-                if device.mac_address == self._mac_address
-            ),
-            None,
-        )
+        return self.coordinator.data.get(self._mac_address)
 
     @property
     @override
     def is_connected(self) -> bool:
         """Return true if the device is connected to the Actiontec router."""
-        return self._device is not None
+        return self._mac_address in self.coordinator.data
 
     @property
     @override
@@ -147,4 +138,12 @@ class ActiontecScannerEntity(
     @override
     def mac_address(self) -> str:
         """Return the MAC address of the device."""
+        return self._mac_address
+
+    @property
+    @override
+    def name(self) -> str | None:
+        """Return the friendly name of the device."""
+        if (device := self._device) is not None:
+            return device.ip_address
         return self._mac_address

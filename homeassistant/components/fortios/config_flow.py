@@ -8,7 +8,7 @@ from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
 from homeassistant.const import CONF_HOST, CONF_TOKEN, CONF_VERIFY_SSL
 
 from .const import DEFAULT_VERIFY_SSL, DOMAIN
-from .coordinator import create_fortios_api
+from .coordinator import create_fortios_api, get_fortios_devices
 
 STEP_USER_DATA_SCHEMA = vol.Schema(
     {
@@ -19,20 +19,33 @@ STEP_USER_DATA_SCHEMA = vol.Schema(
 )
 
 
+def _validate_fortios_connection(
+    host: str, token: str, verify_ssl: bool
+) -> bool:
+    """Login and fetch devices; return True if the API responds successfully."""
+    fgt = create_fortios_api(host, token, verify_ssl)
+    if fgt is None:
+        return False
+    try:
+        get_fortios_devices(fgt)
+    except Exception:  # noqa: BLE001
+        return False
+    return True
+
+
 class FortiOSConfigFlow(ConfigFlow, domain=DOMAIN):
     """Handle a config flow for FortiOS."""
 
     VERSION = 1
 
     async def _async_can_connect(self, user_input: dict[str, Any]) -> bool:
-        """Return true if FortiOS returns data."""
-        fgt = await self.hass.async_add_executor_job(
-            create_fortios_api,
+        """Return true if FortiOS accepts credentials and returns device data."""
+        return await self.hass.async_add_executor_job(
+            _validate_fortios_connection,
             user_input[CONF_HOST],
             user_input[CONF_TOKEN],
             user_input.get(CONF_VERIFY_SSL, DEFAULT_VERIFY_SSL),
         )
-        return fgt is not None
 
     @override
     async def async_step_user(

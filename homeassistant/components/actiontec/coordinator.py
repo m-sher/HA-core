@@ -9,6 +9,7 @@ import telnetlib  # pylint: disable=deprecated-module
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_HOST, CONF_PASSWORD, CONF_USERNAME
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers.device_registry import format_mac
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .const import DOMAIN, LEASES_REGEX
@@ -49,14 +50,14 @@ def get_actiontec_data(host: str, username: str, password: str) -> list[Device] 
             devices.append(
                 Device(
                     match.group("ip"),
-                    match.group("mac").upper(),
+                    format_mac(match.group("mac")),
                     int(match.group("timevalid")),
                 )
             )
     return devices
 
 
-class ActiontecDataUpdateCoordinator(DataUpdateCoordinator[list[Device]]):
+class ActiontecDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Device]]):
     """Class to manage fetching data from the Actiontec router."""
 
     config_entry: ActiontecConfigEntry
@@ -75,7 +76,7 @@ class ActiontecDataUpdateCoordinator(DataUpdateCoordinator[list[Device]]):
         )
 
     @override
-    async def _async_update_data(self) -> list[Device]:
+    async def _async_update_data(self) -> dict[str, Device]:
         """Fetch connected devices from the Actiontec router."""
         if (
             devices := await self.hass.async_add_executor_job(
@@ -85,4 +86,8 @@ class ActiontecDataUpdateCoordinator(DataUpdateCoordinator[list[Device]]):
             raise UpdateFailed(
                 f"Failed to fetch data from Actiontec router {self.host}"
             )
-        return [device for device in devices if device.timevalid > -60]
+        return {
+            device.mac_address: device
+            for device in devices
+            if device.timevalid > -60
+        }

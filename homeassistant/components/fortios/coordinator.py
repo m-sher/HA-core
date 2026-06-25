@@ -10,6 +10,7 @@ from fortiosapi import FortiOSAPI
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_HOST, CONF_TOKEN, CONF_VERIFY_SSL
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers.device_registry import format_mac
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .const import DEFAULT_VERIFY_SSL, DOMAIN, MINIMUM_VERSION
@@ -65,11 +66,11 @@ def get_fortios_devices(fgt: FortiOSAPI) -> dict[str, str | None]:
                 and "master_mac" in client
                 and client["is_online"]
             ):
-                mac = client["master_mac"].upper()
+                mac = format_mac(client["master_mac"])
                 if "hostname" in client:
                     name = client["hostname"]
                 else:
-                    name = client["master_mac"].replace(":", "_")
+                    name = mac.replace(":", "_")
                 devices[mac] = name
     except KeyError as kex:
         _LOGGER.error("Key not found in clients: %s", kex)
