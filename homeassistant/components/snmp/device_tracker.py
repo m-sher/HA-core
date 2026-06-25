@@ -1,46 +1,32 @@
 """Support for fetching WiFi associations through SNMP."""
 
-import binascii
-import logging
-from typing import TYPE_CHECKING, override
+from typing import Any, override
 
-from pysnmp.error import PySnmpError
-from pysnmp.hlapi.v3arch.asyncio import (
-    CommunityData,
-    Udp6TransportTarget,
-    UdpTransportTarget,
-    UsmUserData,
-    bulk_walk_cmd,
-    is_end_of_mib,
-)
 import voluptuous as vol
 
 from homeassistant.components.device_tracker import (
-    DOMAIN as DEVICE_TRACKER_DOMAIN,
     PLATFORM_SCHEMA as DEVICE_TRACKER_PLATFORM_SCHEMA,
-    DeviceScanner,
+    AsyncSeeCallback,
+    ScannerEntity,
 )
+from homeassistant.config_entries import SOURCE_IMPORT
 from homeassistant.const import CONF_HOST
-from homeassistant.core import HomeAssistant
-from homeassistant.helpers import config_validation as cv
-from homeassistant.helpers.typing import ConfigType
+from homeassistant.core import DOMAIN as HOMEASSISTANT_DOMAIN, HomeAssistant, callback
+from homeassistant.data_entry_flow import FlowResultType
+from homeassistant.helpers import config_validation as cv, issue_registry as ir
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
+from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
+from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import (
     CONF_AUTH_KEY,
     CONF_BASEOID,
     CONF_COMMUNITY,
     CONF_PRIV_KEY,
-    DEFAULT_AUTH_PROTOCOL,
     DEFAULT_COMMUNITY,
-    DEFAULT_PORT,
-    DEFAULT_PRIV_PROTOCOL,
-    DEFAULT_TIMEOUT,
-    DEFAULT_VERSION,
-    SNMP_VERSIONS,
+    DOMAIN,
 )
-from .util import RequestArgsType, async_create_request_cmd_args
-
-_LOGGER = logging.getLogger(__name__)
+from .coordinator import SnmpConfigEntry, SnmpDataUpdateCoordinator
 
 PLATFORM_SCHEMA = DEVICE_TRACKER_PLATFORM_SCHEMA.extend(
     {
@@ -53,158 +39,106 @@ PLATFORM_SCHEMA = DEVICE_TRACKER_PLATFORM_SCHEMA.extend(
 )
 
 
-async def async_get_scanner(
-    hass: HomeAssistant, config: ConfigType
-) -> SnmpScanner | None:
-    """Validate the configuration and return an SNMP scanner."""
-    scanner = await SnmpScanner.create(config[DEVICE_TRACKER_DOMAIN])
-    await scanner.async_init(hass)
+async def async_setup_scanner(
+    hass: HomeAssistant,
+    config: ConfigType,
+    _async_see: AsyncSeeCallback,
+    _discovery_info: DiscoveryInfoType | None = None,
+) -> bool:
+    """Set up the legacy SNMP device tracker."""
+    import_data: dict[str, Any] = {
+        CONF_HOST: config[CONF_HOST],
+        CONF_BASEOID: config[CONF_BASEOID],
+        CONF_COMMUNITY: config.get(CONF_COMMUNITY, DEFAULT_COMMUNITY),
+    }
+    if CONF_AUTH_KEY in config:
+        import_data[CONF_AUTH_KEY] = config[CONF_AUTH_KEY]
+    if CONF_PRIV_KEY in config:
+        import_data[CONF_PRIV_KEY] = config[CONF_PRIV_KEY]
 
-    return scanner if scanner.success_init else None
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": SOURCE_IMPORT}, data=import_data
+    )
 
-
-class SnmpScanner(DeviceScanner):
-    """Queries any SNMP capable Access Point for connected devices."""
-
-    def __init__(self, config):
-        """Initialize the scanner after testing the target device."""
-
-        community = config[CONF_COMMUNITY]
-        baseoid = config[CONF_BASEOID]
-        authkey = config.get(CONF_AUTH_KEY)
-        authproto = DEFAULT_AUTH_PROTOCOL
-        privkey = config.get(CONF_PRIV_KEY)
-        privproto = DEFAULT_PRIV_PROTOCOL
-
-        if authkey is not None or privkey is not None:
-            if not authkey:
-                authproto = "none"
-            if not privkey:
-                privproto = "none"
-
-            self._auth_data = UsmUserData(
-                community,
-                authKey=authkey or None,
-                privKey=privkey or None,
-                authProtocol=authproto,
-                privProtocol=privproto,
-            )
-        else:
-            self._auth_data = CommunityData(
-                community, mpModel=SNMP_VERSIONS[DEFAULT_VERSION]
-            )
-
-        self._target: UdpTransportTarget | Udp6TransportTarget
-        self.request_args: RequestArgsType | None = None
-        self.baseoid = baseoid
-        self.last_results = []
-        self.success_init = False
-
-    @classmethod
-    async def create(cls, config):
-        """Test the target device before fully initializing."""
-        host = config[CONF_HOST]
-
-        try:
-            # Try IPv4 first.
-            target = await UdpTransportTarget.create(
-                (host, DEFAULT_PORT), timeout=DEFAULT_TIMEOUT
-            )
-        except PySnmpError:
-            # Then try IPv6.
-            try:
-                target = Udp6TransportTarget(
-                    (host, DEFAULT_PORT), timeout=DEFAULT_TIMEOUT
-                )
-            except PySnmpError as err:
-                _LOGGER.error("Invalid SNMP host: %s", err)
-                return None
-        instance = cls(config)
-        instance._target = target
-
-        return instance
-
-    async def async_init(self, hass: HomeAssistant) -> None:
-        """Check if the target device is reachable and readable."""
-        self.request_args = await async_create_request_cmd_args(
+    if result["type"] is FlowResultType.ABORT and result["reason"] == "cannot_connect":
+        ir.async_create_issue(
             hass,
-            self._auth_data,
-            self._target,
-            self.baseoid,
+            DOMAIN,
+            "yaml_import_cannot_connect",
+            is_fixable=False,
+            issue_domain=DOMAIN,
+            severity=ir.IssueSeverity.ERROR,
+            translation_key="yaml_import_cannot_connect",
+            translation_placeholders={"host": import_data[CONF_HOST]},
         )
-        data = await self.async_get_snmp_data()
-        self.success_init = data is not None
+        return False
 
-    @override
-    async def async_scan_devices(self):
-        """Scan for new devices and return a list with found device IDs."""
-        await self._async_update_info()
-        return [client["mac"] for client in self.last_results if client.get("mac")]
+    ir.async_delete_issue(hass, DOMAIN, "yaml_import_cannot_connect")
+    ir.async_create_issue(
+        hass,
+        HOMEASSISTANT_DOMAIN,
+        f"deprecated_yaml_{DOMAIN}",
+        is_fixable=False,
+        issue_domain=DOMAIN,
+        severity=ir.IssueSeverity.WARNING,
+        translation_key="deprecated_yaml",
+        translation_placeholders={
+            "domain": DOMAIN,
+            "integration_title": "SNMP",
+        },
+    )
+    return True
 
+
+async def async_setup_entry(
+    hass: HomeAssistant,
+    config_entry: SnmpConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
+) -> None:
+    """Set up the SNMP device tracker from a config entry."""
+    coordinator = config_entry.runtime_data
+    tracked: set[str] = set()
+
+    @callback
+    def _async_add_new_devices() -> None:
+        """Add newly discovered devices from the coordinator."""
+        new_entities: list[SnmpScannerEntity] = []
+        for mac in coordinator.data:
+            if mac not in tracked:
+                tracked.add(mac)
+                new_entities.append(SnmpScannerEntity(coordinator, mac))
+        if new_entities:
+            async_add_entities(new_entities)
+
+    config_entry.async_on_unload(coordinator.async_add_listener(_async_add_new_devices))
+    _async_add_new_devices()
+
+
+class SnmpScannerEntity(CoordinatorEntity[SnmpDataUpdateCoordinator], ScannerEntity):
+    """Representation of a device discovered via SNMP."""
+
+    def __init__(self, coordinator: SnmpDataUpdateCoordinator, mac: str) -> None:
+        """Initialize the tracked device."""
+        super().__init__(coordinator)
+        self._mac = mac
+        self._attr_name = mac
+
+    @property
     @override
-    async def async_get_device_name(self, device: str) -> str | None:
-        """Return the name of the given device or None if we don't know."""
-        # We have no names
+    def is_connected(self) -> bool:
+        """Return true if the device is present in the latest SNMP scan."""
+        return self._mac in self.coordinator.data
+
+    @property
+    @override
+    def mac_address(self) -> str:
+        """Return the MAC address of the device."""
+        return self._mac
+
+    @property
+    @override
+    def extra_state_attributes(self) -> dict[str, Any] | None:
+        """Return extra attributes of the device."""
+        if self._mac in self.coordinator.data:
+            return {"mac": self._mac}
         return None
-
-    @override
-    async def async_get_extra_attributes(self, device: str) -> dict:
-        """Return extra attributes of the given device."""
-        for client in self.last_results:
-            if client.get("mac") and device == client["mac"]:
-                return {"mac": client["mac"]}
-        return {}
-
-    async def _async_update_info(self):
-        """Ensure the information from the device is up to date.
-
-        Return boolean if scanning successful.
-        """
-        if not self.success_init:
-            return False
-
-        if not (data := await self.async_get_snmp_data()):
-            return False
-
-        self.last_results = data
-        return True
-
-    async def async_get_snmp_data(self):
-        """Fetch MAC addresses from access point via SNMP."""
-        devices = []
-        if TYPE_CHECKING:
-            assert self.request_args is not None
-
-        engine, auth_data, target, context_data, object_type = self.request_args
-        walker = bulk_walk_cmd(
-            engine,
-            auth_data,
-            target,
-            context_data,
-            0,
-            50,
-            object_type,
-            lexicographicMode=False,
-        )
-        async for errindication, errstatus, errindex, res in walker:
-            if errindication:
-                _LOGGER.error("SNMPLIB error: %s", errindication)
-                return None
-            if errstatus:
-                _LOGGER.error(
-                    "SNMP error: %s at %s",
-                    errstatus.prettyPrint(),
-                    (errindex and res[int(errindex) - 1][0]) or "?",
-                )
-                return None
-
-            for _oid, value in res:
-                if not is_end_of_mib(res):
-                    try:
-                        mac = binascii.hexlify(value.asOctets()).decode("utf-8")
-                    except AttributeError:
-                        continue
-                    _LOGGER.debug("Found MAC address: %s", mac)
-                    mac = ":".join([mac[i : i + 2] for i in range(0, len(mac), 2)])
-                    devices.append({"mac": mac})
-        return devices

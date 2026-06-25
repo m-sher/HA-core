@@ -1,16 +1,15 @@
 """Device tracker for Synology SRM routers."""
 
-import logging
-from typing import override
+from typing import Any, override
 
-import synology_srm
 import voluptuous as vol
 
 from homeassistant.components.device_tracker import (
-    DOMAIN as DEVICE_TRACKER_DOMAIN,
     PLATFORM_SCHEMA as DEVICE_TRACKER_PLATFORM_SCHEMA,
-    DeviceScanner,
+    AsyncSeeCallback,
+    ScannerEntity,
 )
+from homeassistant.config_entries import SOURCE_IMPORT
 from homeassistant.const import (
     CONF_HOST,
     CONF_PASSWORD,
@@ -19,16 +18,22 @@ from homeassistant.const import (
     CONF_USERNAME,
     CONF_VERIFY_SSL,
 )
-from homeassistant.core import HomeAssistant
-from homeassistant.helpers import config_validation as cv
-from homeassistant.helpers.typing import ConfigType
+from homeassistant.core import DOMAIN as HOMEASSISTANT_DOMAIN, HomeAssistant, callback
+from homeassistant.data_entry_flow import FlowResultType
+from homeassistant.helpers import config_validation as cv, issue_registry as ir
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
+from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
+from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-_LOGGER = logging.getLogger(__name__)
-
-DEFAULT_USERNAME = "admin"
-DEFAULT_PORT = 8001
-DEFAULT_SSL = True
-DEFAULT_VERIFY_SSL = False
+from .const import (
+    ATTRIBUTE_ALIAS,
+    DEFAULT_PORT,
+    DEFAULT_SSL,
+    DEFAULT_USERNAME,
+    DEFAULT_VERIFY_SSL,
+    DOMAIN,
+)
+from .coordinator import SynologySrmConfigEntry, SynologySrmDataUpdateCoordinator
 
 PLATFORM_SCHEMA = DEVICE_TRACKER_PLATFORM_SCHEMA.extend(
     {
@@ -41,109 +46,137 @@ PLATFORM_SCHEMA = DEVICE_TRACKER_PLATFORM_SCHEMA.extend(
     }
 )
 
-ATTRIBUTE_ALIAS = {
-    "band": None,
-    "connection": None,
-    "current_rate": None,
-    "dev_type": None,
-    "hostname": None,
-    "ip6_addr": None,
-    "ip_addr": None,
-    "is_baned": "is_banned",
-    "is_beamforming_on": None,
-    "is_guest": None,
-    "is_high_qos": None,
-    "is_low_qos": None,
-    "is_manual_dev_type": None,
-    "is_manual_hostname": None,
-    "is_online": None,
-    "is_parental_controled": "is_parental_controlled",
-    "is_qos": None,
-    "is_wireless": None,
-    "mac": None,
-    "max_rate": None,
-    "mesh_node_id": None,
-    "rate_quality": None,
-    "signalstrength": "signal_strength",
-    "transferRXRate": "transfer_rx_rate",
-    "transferTXRate": "transfer_tx_rate",
-}
 
+async def async_setup_scanner(
+    hass: HomeAssistant,
+    config: ConfigType,
+    _async_see: AsyncSeeCallback,
+    _discovery_info: DiscoveryInfoType | None = None,
+) -> bool:
+    """Set up the legacy Synology SRM device tracker."""
+    import_data = {
+        CONF_HOST: config[CONF_HOST],
+        CONF_USERNAME: config[CONF_USERNAME],
+        CONF_PASSWORD: config[CONF_PASSWORD],
+        CONF_PORT: config.get(CONF_PORT, DEFAULT_PORT),
+        CONF_SSL: config.get(CONF_SSL, DEFAULT_SSL),
+        CONF_VERIFY_SSL: config.get(CONF_VERIFY_SSL, DEFAULT_VERIFY_SSL),
+    }
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": SOURCE_IMPORT}, data=import_data
+    )
 
-def get_scanner(
-    hass: HomeAssistant, config: ConfigType
-) -> SynologySrmDeviceScanner | None:
-    """Validate the configuration and return Synology SRM scanner."""
-    scanner = SynologySrmDeviceScanner(config[DEVICE_TRACKER_DOMAIN])
-
-    return scanner if scanner.success_init else None
-
-
-class SynologySrmDeviceScanner(DeviceScanner):
-    """Scanner for devices connected to a Synology SRM router."""
-
-    def __init__(self, config):
-        """Initialize the scanner."""
-
-        self.client = synology_srm.Client(
-            host=config[CONF_HOST],
-            port=config[CONF_PORT],
-            username=config[CONF_USERNAME],
-            password=config[CONF_PASSWORD],
-            https=config[CONF_SSL],
+    if result["type"] is FlowResultType.ABORT and result["reason"] == "cannot_connect":
+        ir.async_create_issue(
+            hass,
+            DOMAIN,
+            "yaml_import_cannot_connect",
+            is_fixable=False,
+            issue_domain=DOMAIN,
+            severity=ir.IssueSeverity.ERROR,
+            translation_key="yaml_import_cannot_connect",
+            translation_placeholders={"host": import_data[CONF_HOST]},
         )
+        return False
 
-        if not config[CONF_VERIFY_SSL]:
-            self.client.http.disable_https_verify()
+    ir.async_delete_issue(hass, DOMAIN, "yaml_import_cannot_connect")
+    ir.async_create_issue(
+        hass,
+        HOMEASSISTANT_DOMAIN,
+        f"deprecated_yaml_{DOMAIN}",
+        is_fixable=False,
+        issue_domain=DOMAIN,
+        severity=ir.IssueSeverity.WARNING,
+        translation_key="deprecated_yaml",
+        translation_placeholders={
+            "domain": DOMAIN,
+            "integration_title": "Synology SRM",
+        },
+    )
+    return True
 
-        self.devices = []
-        self.success_init = self._update_info()
 
+async def async_setup_entry(
+    hass: HomeAssistant,
+    config_entry: SynologySrmConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
+) -> None:
+    """Set up the Synology SRM device tracker from a config entry."""
+    coordinator = config_entry.runtime_data
+    tracked: set[str] = set()
+
+    @callback
+    def _async_add_new_devices() -> None:
+        """Add newly discovered devices from the coordinator."""
+        new_entities: list[SynologySrmScannerEntity] = []
+        for mac in coordinator.data:
+            if mac not in tracked:
+                tracked.add(mac)
+                new_entities.append(SynologySrmScannerEntity(coordinator, mac))
+        if new_entities:
+            async_add_entities(new_entities)
+
+    config_entry.async_on_unload(coordinator.async_add_listener(_async_add_new_devices))
+    _async_add_new_devices()
+
+
+class SynologySrmScannerEntity(
+    CoordinatorEntity[SynologySrmDataUpdateCoordinator], ScannerEntity
+):
+    """Representation of a device connected to a Synology SRM router."""
+
+    def __init__(
+        self, coordinator: SynologySrmDataUpdateCoordinator, mac: str
+    ) -> None:
+        """Initialize the tracked device."""
+        super().__init__(coordinator)
+        self._mac = mac
+        device = coordinator.data.get(mac, {})
+        self._attr_name = device.get("hostname") or mac
+
+    @property
+    def _device(self) -> dict[str, Any] | None:
+        """Return the current device data."""
+        return self.coordinator.data.get(self._mac)
+
+    @property
     @override
-    def scan_devices(self):
-        """Scan for new devices and return a list with found device IDs."""
-        self._update_info()
+    def is_connected(self) -> bool:
+        """Return true if the device is connected to the router."""
+        return self._mac in self.coordinator.data
 
-        return [device["mac"] for device in self.devices]
-
+    @property
     @override
-    def get_extra_attributes(self, device) -> dict:
-        """Get the extra attributes of a device."""
-        device = next(
-            (result for result in self.devices if result["mac"] == device), None
-        )
-        filtered_attributes: dict[str, str] = {}
+    def mac_address(self) -> str:
+        """Return the MAC address of the device."""
+        return self._mac
+
+    @property
+    @override
+    def hostname(self) -> str | None:
+        """Return the hostname of the device."""
+        if device := self._device:
+            return device.get("hostname")
+        return None
+
+    @property
+    @override
+    def ip_address(self) -> str | None:
+        """Return the IP address of the device."""
+        if device := self._device:
+            return device.get("ip_addr")
+        return None
+
+    @property
+    @override
+    def extra_state_attributes(self) -> dict[str, Any] | None:
+        """Return extra attributes of the device."""
+        device = self._device
         if not device:
-            return filtered_attributes
+            return None
+        attributes: dict[str, Any] = {}
         for attribute, alias in ATTRIBUTE_ALIAS.items():
             if (value := device.get(attribute)) is None:
                 continue
-            attr = alias or attribute
-            filtered_attributes[attr] = value
-        return filtered_attributes
-
-    @override
-    def get_device_name(self, device):
-        """Return the name of the given device or None if we don't know."""
-        filter_named = [
-            result["hostname"] for result in self.devices if result["mac"] == device
-        ]
-
-        if filter_named:
-            return filter_named[0]
-
-        return None
-
-    def _update_info(self):
-        """Check the router for connected devices."""
-        _LOGGER.debug("Scanning for connected devices")
-
-        try:
-            self.devices = self.client.core.get_network_nsm_device({"is_online": True})
-        except synology_srm.http.SynologyException as ex:
-            _LOGGER.error("Error with the Synology SRM: %s", ex)
-            return False
-
-        _LOGGER.debug("Found %d device(s) connected to the router", len(self.devices))
-
-        return True
+            attributes[alias or attribute] = value
+        return attributes

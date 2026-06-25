@@ -1,16 +1,15 @@
 """Support for Cisco Mobility Express."""
 
-import logging
-from typing import override
+from typing import Any, override
 
-from ciscomobilityexpress.ciscome import CiscoMobilityExpress
 import voluptuous as vol
 
 from homeassistant.components.device_tracker import (
-    DOMAIN as DEVICE_TRACKER_DOMAIN,
     PLATFORM_SCHEMA as DEVICE_TRACKER_PLATFORM_SCHEMA,
-    DeviceScanner,
+    AsyncSeeCallback,
+    ScannerEntity,
 )
+from homeassistant.config_entries import SOURCE_IMPORT
 from homeassistant.const import (
     CONF_HOST,
     CONF_PASSWORD,
@@ -18,14 +17,18 @@ from homeassistant.const import (
     CONF_USERNAME,
     CONF_VERIFY_SSL,
 )
-from homeassistant.core import HomeAssistant
-from homeassistant.helpers import config_validation as cv
-from homeassistant.helpers.typing import ConfigType
+from homeassistant.core import DOMAIN as HOMEASSISTANT_DOMAIN, HomeAssistant, callback
+from homeassistant.data_entry_flow import FlowResultType
+from homeassistant.helpers import config_validation as cv, issue_registry as ir
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
+from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
+from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-_LOGGER = logging.getLogger(__name__)
-
-DEFAULT_SSL = False
-DEFAULT_VERIFY_SSL = True
+from .const import DEFAULT_SSL, DEFAULT_VERIFY_SSL, DOMAIN
+from .coordinator import (
+    CiscoMobilityExpressConfigEntry,
+    CiscoMobilityExpressDataUpdateCoordinator,
+)
 
 PLATFORM_SCHEMA = DEVICE_TRACKER_PLATFORM_SCHEMA.extend(
     {
@@ -38,61 +41,121 @@ PLATFORM_SCHEMA = DEVICE_TRACKER_PLATFORM_SCHEMA.extend(
 )
 
 
-def get_scanner(hass: HomeAssistant, config: ConfigType) -> CiscoMEDeviceScanner | None:
-    """Validate the configuration and return a Cisco ME scanner."""
-
-    config = config[DEVICE_TRACKER_DOMAIN]
-
-    controller = CiscoMobilityExpress(
-        config[CONF_HOST],
-        config[CONF_USERNAME],
-        config[CONF_PASSWORD],
-        config[CONF_SSL],
-        config[CONF_VERIFY_SSL],
+async def async_setup_scanner(
+    hass: HomeAssistant,
+    config: ConfigType,
+    _async_see: AsyncSeeCallback,
+    _discovery_info: DiscoveryInfoType | None = None,
+) -> bool:
+    """Set up the legacy Cisco Mobility Express device tracker."""
+    import_data = {
+        CONF_HOST: config[CONF_HOST],
+        CONF_USERNAME: config[CONF_USERNAME],
+        CONF_PASSWORD: config[CONF_PASSWORD],
+        CONF_SSL: config.get(CONF_SSL, DEFAULT_SSL),
+        CONF_VERIFY_SSL: config.get(CONF_VERIFY_SSL, DEFAULT_VERIFY_SSL),
+    }
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": SOURCE_IMPORT}, data=import_data
     )
-    if not controller.is_logged_in():
+
+    if result["type"] is FlowResultType.ABORT and result["reason"] == "cannot_connect":
+        ir.async_create_issue(
+            hass,
+            DOMAIN,
+            "yaml_import_cannot_connect",
+            is_fixable=False,
+            issue_domain=DOMAIN,
+            severity=ir.IssueSeverity.ERROR,
+            translation_key="yaml_import_cannot_connect",
+            translation_placeholders={"host": import_data[CONF_HOST]},
+        )
+        return False
+
+    ir.async_delete_issue(hass, DOMAIN, "yaml_import_cannot_connect")
+    ir.async_create_issue(
+        hass,
+        HOMEASSISTANT_DOMAIN,
+        f"deprecated_yaml_{DOMAIN}",
+        is_fixable=False,
+        issue_domain=DOMAIN,
+        severity=ir.IssueSeverity.WARNING,
+        translation_key="deprecated_yaml",
+        translation_placeholders={
+            "domain": DOMAIN,
+            "integration_title": "Cisco Mobility Express",
+        },
+    )
+    return True
+
+
+async def async_setup_entry(
+    hass: HomeAssistant,
+    config_entry: CiscoMobilityExpressConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
+) -> None:
+    """Set up the Cisco Mobility Express device tracker from a config entry."""
+    coordinator = config_entry.runtime_data
+    tracked: set[str] = set()
+
+    @callback
+    def _async_add_new_devices() -> None:
+        """Add newly discovered devices from the coordinator."""
+        new_entities: list[CiscoMEScannerEntity] = []
+        for mac in coordinator.data:
+            if mac not in tracked:
+                tracked.add(mac)
+                new_entities.append(CiscoMEScannerEntity(coordinator, mac))
+        if new_entities:
+            async_add_entities(new_entities)
+
+    config_entry.async_on_unload(coordinator.async_add_listener(_async_add_new_devices))
+    _async_add_new_devices()
+
+
+class CiscoMEScannerEntity(
+    CoordinatorEntity[CiscoMobilityExpressDataUpdateCoordinator], ScannerEntity
+):
+    """Representation of a device connected to a Cisco Mobility Express controller."""
+
+    def __init__(
+        self, coordinator: CiscoMobilityExpressDataUpdateCoordinator, mac_address: str
+    ) -> None:
+        """Initialize the tracked device."""
+        super().__init__(coordinator)
+        self._mac_address = mac_address
+        device = coordinator.data.get(mac_address, {})
+        self._attr_name = device.get("clId") or mac_address
+
+    @property
+    def _device(self) -> dict[str, Any] | None:
+        """Return the current device data."""
+        return self.coordinator.data.get(self._mac_address)
+
+    @property
+    @override
+    def is_connected(self) -> bool:
+        """Return true if the device is connected to the Cisco ME controller."""
+        return self._mac_address in self.coordinator.data
+
+    @property
+    @override
+    def mac_address(self) -> str:
+        """Return the MAC address of the device."""
+        return self._mac_address
+
+    @property
+    @override
+    def hostname(self) -> str | None:
+        """Return the hostname of the device."""
+        if device := self._device:
+            return device.get("clId")
         return None
-    return CiscoMEDeviceScanner(controller)
 
-
-class CiscoMEDeviceScanner(DeviceScanner):
-    """Scanner for devices associated to a Cisco ME controller."""
-
-    def __init__(self, controller):
-        """Initialize the scanner."""
-        self.controller = controller
-        self.last_results = {}
-
+    @property
     @override
-    def scan_devices(self):
-        """Scan for new devices and return a list with found device IDs."""
-        self._update_info()
-
-        return [device.macaddr for device in self.last_results]
-
-    @override
-    def get_device_name(self, device):
-        """Return the name of the given device or None if we don't know."""
-        return next(
-            (result.clId for result in self.last_results if result.macaddr == device),
-            None,
-        )
-
-    @override
-    def get_extra_attributes(self, device):
-        """Get extra attributes of a device.
-
-        Some known extra attributes that may be returned in the device tuple
-        include SSID, PT (eg 802.11ac), devtype (eg iPhone 7) among others.
-        """
-        device = next(
-            (result for result in self.last_results if result.macaddr == device), None
-        )
-        return device._asdict()
-
-    def _update_info(self):
-        """Check the Cisco ME controller for devices."""
-        self.last_results = self.controller.get_associated_devices()
-        _LOGGER.debug(
-            "Cisco Mobility Express controller returned: %s", self.last_results
-        )
+    def extra_state_attributes(self) -> dict[str, Any] | None:
+        """Return extra attributes of the device."""
+        if device := self._device:
+            return device
+        return None

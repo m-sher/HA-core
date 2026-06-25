@@ -1,16 +1,15 @@
 """Support for OpenWRT (luci) routers."""
 
-import logging
-from typing import override
+from typing import Any, override
 
-from openwrt_luci_rpc import OpenWrtRpc
 import voluptuous as vol
 
 from homeassistant.components.device_tracker import (
-    DOMAIN as DEVICE_TRACKER_DOMAIN,
     PLATFORM_SCHEMA as DEVICE_TRACKER_PLATFORM_SCHEMA,
-    DeviceScanner,
+    AsyncSeeCallback,
+    ScannerEntity,
 )
+from homeassistant.config_entries import SOURCE_IMPORT
 from homeassistant.const import (
     CONF_HOST,
     CONF_PASSWORD,
@@ -18,14 +17,15 @@ from homeassistant.const import (
     CONF_USERNAME,
     CONF_VERIFY_SSL,
 )
-from homeassistant.core import HomeAssistant
-from homeassistant.helpers import config_validation as cv
-from homeassistant.helpers.typing import ConfigType
+from homeassistant.core import DOMAIN as HOMEASSISTANT_DOMAIN, HomeAssistant, callback
+from homeassistant.data_entry_flow import FlowResultType
+from homeassistant.helpers import config_validation as cv, issue_registry as ir
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
+from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
+from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-_LOGGER = logging.getLogger(__name__)
-
-DEFAULT_SSL = False
-DEFAULT_VERIFY_SSL = True
+from .const import DEFAULT_SSL, DEFAULT_VERIFY_SSL, DOMAIN
+from .coordinator import LuciConfigEntry, LuciDataUpdateCoordinator
 
 PLATFORM_SCHEMA = DEVICE_TRACKER_PLATFORM_SCHEMA.extend(
     {
@@ -38,73 +38,125 @@ PLATFORM_SCHEMA = DEVICE_TRACKER_PLATFORM_SCHEMA.extend(
 )
 
 
-def get_scanner(hass: HomeAssistant, config: ConfigType) -> LuciDeviceScanner | None:
-    """Validate the configuration and return a Luci scanner."""
-    scanner = LuciDeviceScanner(config[DEVICE_TRACKER_DOMAIN])
+async def async_setup_scanner(
+    hass: HomeAssistant,
+    config: ConfigType,
+    _async_see: AsyncSeeCallback,
+    _discovery_info: DiscoveryInfoType | None = None,
+) -> bool:
+    """Set up the legacy OpenWrt (luci) device tracker."""
+    import_data = {
+        CONF_HOST: config[CONF_HOST],
+        CONF_USERNAME: config[CONF_USERNAME],
+        CONF_PASSWORD: config[CONF_PASSWORD],
+        CONF_SSL: config.get(CONF_SSL, DEFAULT_SSL),
+        CONF_VERIFY_SSL: config.get(CONF_VERIFY_SSL, DEFAULT_VERIFY_SSL),
+    }
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": SOURCE_IMPORT}, data=import_data
+    )
 
-    return scanner if scanner.success_init else None
-
-
-class LuciDeviceScanner(DeviceScanner):
-    """Scanner for devices connected to an OpenWrt router."""
-
-    def __init__(self, config):
-        """Initialize the scanner."""
-
-        self.router = OpenWrtRpc(
-            config[CONF_HOST],
-            config[CONF_USERNAME],
-            config[CONF_PASSWORD],
-            config[CONF_SSL],
-            config[CONF_VERIFY_SSL],
+    if result["type"] is FlowResultType.ABORT and result["reason"] == "cannot_connect":
+        ir.async_create_issue(
+            hass,
+            DOMAIN,
+            "yaml_import_cannot_connect",
+            is_fixable=False,
+            issue_domain=DOMAIN,
+            severity=ir.IssueSeverity.ERROR,
+            translation_key="yaml_import_cannot_connect",
+            translation_placeholders={"host": import_data[CONF_HOST]},
         )
+        return False
 
-        self.last_results = {}
-        self.success_init = self.router.is_logged_in()
+    ir.async_delete_issue(hass, DOMAIN, "yaml_import_cannot_connect")
+    ir.async_create_issue(
+        hass,
+        HOMEASSISTANT_DOMAIN,
+        f"deprecated_yaml_{DOMAIN}",
+        is_fixable=False,
+        issue_domain=DOMAIN,
+        severity=ir.IssueSeverity.WARNING,
+        translation_key="deprecated_yaml",
+        translation_placeholders={
+            "domain": DOMAIN,
+            "integration_title": "OpenWrt (luci)",
+        },
+    )
+    return True
 
+
+async def async_setup_entry(
+    hass: HomeAssistant,
+    config_entry: LuciConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
+) -> None:
+    """Set up the OpenWrt (luci) device tracker from a config entry."""
+    coordinator = config_entry.runtime_data
+    tracked: set[str] = set()
+
+    @callback
+    def _async_add_new_devices() -> None:
+        """Add newly discovered devices from the coordinator."""
+        new_entities: list[LuciScannerEntity] = []
+        for mac in coordinator.data:
+            if mac not in tracked:
+                tracked.add(mac)
+                new_entities.append(LuciScannerEntity(coordinator, mac))
+        if new_entities:
+            async_add_entities(new_entities)
+
+    config_entry.async_on_unload(coordinator.async_add_listener(_async_add_new_devices))
+    _async_add_new_devices()
+
+
+class LuciScannerEntity(CoordinatorEntity[LuciDataUpdateCoordinator], ScannerEntity):
+    """Representation of a device connected to an OpenWrt router."""
+
+    def __init__(self, coordinator: LuciDataUpdateCoordinator, mac: str) -> None:
+        """Initialize the tracked device."""
+        super().__init__(coordinator)
+        self._mac = mac
+        device = coordinator.data.get(mac, {})
+        self._attr_name = device.get("hostname") or mac
+
+    @property
+    def _device(self) -> dict[str, Any] | None:
+        """Return the current device data."""
+        return self.coordinator.data.get(self._mac)
+
+    @property
     @override
-    def scan_devices(self):
-        """Scan for new devices and return a list with found device IDs."""
-        self._update_info()
+    def is_connected(self) -> bool:
+        """Return true if the device is connected to the OpenWrt router."""
+        return self._mac in self.coordinator.data
 
-        return [device.mac for device in self.last_results]
-
+    @property
     @override
-    def get_device_name(self, device):
-        """Return the name of the given device or None if we don't know."""
-        return next(
-            (result.hostname for result in self.last_results if result.mac == device),
-            None,
-        )
+    def mac_address(self) -> str:
+        """Return the MAC address of the device."""
+        return self._mac
 
+    @property
     @override
-    def get_extra_attributes(self, device):
-        """Get extra attributes of a device.
+    def ip_address(self) -> str | None:
+        """Return the IP address of the device."""
+        if device := self._device:
+            return device.get("ip")
+        return None
 
-        Some known extra attributes that may be returned in the device tuple
-        include MAC address (mac), network device (dev), IP address
-        (ip), reachable status (reachable), associated router
-        (host), hostname if known (hostname) among others.
-        """
-        if not (
-            device := next(
-                (result for result in self.last_results if result.mac == device), None
-            )
-        ):
-            return {}
-        return device._asdict()
+    @property
+    @override
+    def hostname(self) -> str | None:
+        """Return the hostname of the device."""
+        if device := self._device:
+            return device.get("hostname")
+        return None
 
-    def _update_info(self):
-        """Check the Luci router for devices."""
-        result = self.router.get_all_connected_devices(only_reachable=True)
-
-        _LOGGER.debug("Luci get_all_connected_devices returned: %s", result)
-
-        self.last_results = [
-            device
-            for device in result
-            if not hasattr(self.router.router.owrt_version, "release")
-            or not self.router.router.owrt_version.release
-            or self.router.router.owrt_version.release[0] < 19
-            or device.reachable
-        ]
+    @property
+    @override
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Return extra attributes of the device."""
+        if device := self._device:
+            return device
+        return {}

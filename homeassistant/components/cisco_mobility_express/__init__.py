@@ -1,1 +1,29 @@
-"""Component to embed Cisco Mobility Express."""
+"""The Cisco Mobility Express integration."""
+
+from homeassistant.const import Platform
+from homeassistant.core import HomeAssistant
+
+from .coordinator import (
+    CiscoMobilityExpressConfigEntry,
+    CiscoMobilityExpressDataUpdateCoordinator,
+)
+
+PLATFORMS = [Platform.DEVICE_TRACKER]
+
+
+async def async_setup_entry(
+    hass: HomeAssistant, entry: CiscoMobilityExpressConfigEntry
+) -> bool:
+    """Set up Cisco Mobility Express from a config entry."""
+    coordinator = CiscoMobilityExpressDataUpdateCoordinator(hass, entry)
+    await coordinator.async_config_entry_first_refresh()
+    entry.runtime_data = coordinator
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+    return True
+
+
+async def async_unload_entry(
+    hass: HomeAssistant, entry: CiscoMobilityExpressConfigEntry
+) -> bool:
+    """Unload a config entry."""
+    return await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
