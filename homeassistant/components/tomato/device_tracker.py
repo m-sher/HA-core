@@ -1,19 +1,15 @@
 """Support for Tomato routers."""
 
-from http import HTTPStatus
-import json
-import logging
-import re
 from typing import override
 
-import requests
 import voluptuous as vol
 
 from homeassistant.components.device_tracker import (
-    DOMAIN as DEVICE_TRACKER_DOMAIN,
     PLATFORM_SCHEMA as DEVICE_TRACKER_PLATFORM_SCHEMA,
-    DeviceScanner,
+    AsyncSeeCallback,
+    ScannerEntity,
 )
+from homeassistant.config_entries import SOURCE_IMPORT
 from homeassistant.const import (
     CONF_HOST,
     CONF_PASSWORD,
@@ -22,13 +18,15 @@ from homeassistant.const import (
     CONF_USERNAME,
     CONF_VERIFY_SSL,
 )
-from homeassistant.core import HomeAssistant
-from homeassistant.helpers import config_validation as cv
-from homeassistant.helpers.typing import ConfigType
+from homeassistant.core import DOMAIN as HOMEASSISTANT_DOMAIN, HomeAssistant, callback
+from homeassistant.data_entry_flow import FlowResultType
+from homeassistant.helpers import config_validation as cv, issue_registry as ir
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
+from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
+from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-CONF_HTTP_ID = "http_id"
-
-_LOGGER = logging.getLogger(__name__)
+from .const import CONF_HTTP_ID, DOMAIN
+from .coordinator import TomatoConfigEntry, TomatoDataUpdateCoordinator
 
 PLATFORM_SCHEMA = DEVICE_TRACKER_PLATFORM_SCHEMA.extend(
     {
@@ -43,101 +41,109 @@ PLATFORM_SCHEMA = DEVICE_TRACKER_PLATFORM_SCHEMA.extend(
 )
 
 
-def get_scanner(hass: HomeAssistant, config: ConfigType) -> TomatoDeviceScanner:
-    """Validate the configuration and returns a Tomato scanner."""
-    return TomatoDeviceScanner(config[DEVICE_TRACKER_DOMAIN])
+async def async_setup_scanner(
+    hass: HomeAssistant,
+    config: ConfigType,
+    _async_see: AsyncSeeCallback,
+    _discovery_info: DiscoveryInfoType | None = None,
+) -> bool:
+    """Set up the legacy Tomato device tracker."""
+    import_data = {
+        CONF_HOST: config[CONF_HOST],
+        CONF_USERNAME: config[CONF_USERNAME],
+        CONF_PASSWORD: config[CONF_PASSWORD],
+        CONF_HTTP_ID: config[CONF_HTTP_ID],
+        CONF_SSL: config.get(CONF_SSL, False),
+        CONF_VERIFY_SSL: config.get(CONF_VERIFY_SSL, True),
+    }
+    if CONF_PORT in config:
+        import_data[CONF_PORT] = config[CONF_PORT]
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": SOURCE_IMPORT}, data=import_data
+    )
+
+    if result["type"] is FlowResultType.ABORT and result["reason"] == "cannot_connect":
+        ir.async_create_issue(
+            hass,
+            DOMAIN,
+            "yaml_import_cannot_connect",
+            is_fixable=False,
+            issue_domain=DOMAIN,
+            severity=ir.IssueSeverity.ERROR,
+            translation_key="yaml_import_cannot_connect",
+            translation_placeholders={"host": import_data[CONF_HOST]},
+        )
+        return False
+
+    ir.async_delete_issue(hass, DOMAIN, "yaml_import_cannot_connect")
+    ir.async_create_issue(
+        hass,
+        HOMEASSISTANT_DOMAIN,
+        f"deprecated_yaml_{DOMAIN}",
+        is_fixable=False,
+        issue_domain=DOMAIN,
+        severity=ir.IssueSeverity.WARNING,
+        translation_key="deprecated_yaml",
+        translation_placeholders={
+            "domain": DOMAIN,
+            "integration_title": "Tomato",
+        },
+    )
+    return True
 
 
-class TomatoDeviceScanner(DeviceScanner):
-    """Class which queries a wireless router running Tomato firmware."""
+async def async_setup_entry(
+    hass: HomeAssistant,
+    config_entry: TomatoConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
+) -> None:
+    """Set up the Tomato device tracker from a config entry."""
+    coordinator = config_entry.runtime_data
+    tracked: set[str] = set()
 
-    def __init__(self, config):
-        """Initialize the scanner."""
-        host, http_id = config[CONF_HOST], config[CONF_HTTP_ID]
-        port = config.get(CONF_PORT)
-        username, password = config[CONF_USERNAME], config[CONF_PASSWORD]
-        self.ssl, self.verify_ssl = config[CONF_SSL], config[CONF_VERIFY_SSL]
-        if port is None:
-            port = 443 if self.ssl else 80
+    @callback
+    def _async_add_new_devices() -> None:
+        """Add newly discovered devices from the coordinator."""
+        new_entities: list[TomatoScannerEntity] = []
+        for mac in coordinator.data:
+            if mac not in tracked:
+                tracked.add(mac)
+                new_entities.append(TomatoScannerEntity(coordinator, mac))
+        if new_entities:
+            async_add_entities(new_entities)
 
-        protocol = "https" if self.ssl else "http"
-        self.req = requests.Request(
-            "POST",
-            f"{protocol}://{host}:{port}/update.cgi",
-            data={"_http_id": http_id, "exec": "devlist"},
-            auth=requests.auth.HTTPBasicAuth(username, password),
-        ).prepare()
+    config_entry.async_on_unload(coordinator.async_add_listener(_async_add_new_devices))
+    _async_add_new_devices()
 
-        self.parse_api_pattern = re.compile(r"(?P<param>\w*) = (?P<value>.*);")
 
-        self.last_results = {"wldev": [], "dhcpd_lease": []}
+class TomatoScannerEntity(
+    CoordinatorEntity[TomatoDataUpdateCoordinator], ScannerEntity
+):
+    """Representation of a device connected to the Tomato router."""
 
-        self.success_init = self._update_tomato_info()
+    def __init__(self, coordinator: TomatoDataUpdateCoordinator, mac: str) -> None:
+        """Initialize the tracked device."""
+        super().__init__(coordinator)
+        self._mac = mac
+        device = coordinator.data.get(mac)
+        self._attr_name = (device.hostname if device else None) or mac
 
+    @property
     @override
-    def scan_devices(self):
-        """Scan for new devices and return a list with found device IDs."""
-        self._update_tomato_info()
+    def is_connected(self) -> bool:
+        """Return true if the device is connected."""
+        return self._mac in self.coordinator.data
 
-        return [item[1] for item in self.last_results["wldev"]]
-
+    @property
     @override
-    def get_device_name(self, device):
-        """Return the name of the given device or None if we don't know."""
-        filter_named = [
-            item[0] for item in self.last_results["dhcpd_lease"] if item[2] == device
-        ]
+    def mac_address(self) -> str:
+        """Return the MAC address of the device."""
+        return self._mac
 
-        if not filter_named or not filter_named[0]:
-            return None
-
-        return filter_named[0]
-
-    def _update_tomato_info(self):
-        """Ensure the information from the Tomato router is up to date.
-
-        Return boolean if scanning successful.
-        """
-        _LOGGER.debug("Scanning")
-
-        try:
-            if self.ssl:
-                response = requests.Session().send(
-                    self.req, timeout=60, verify=self.verify_ssl
-                )
-            else:
-                response = requests.Session().send(self.req, timeout=60)
-
-            # Calling and parsing the Tomato api here. We only need the
-            # wldev and dhcpd_lease values.
-            if response.status_code == HTTPStatus.OK:
-                for param, value in self.parse_api_pattern.findall(response.text):
-                    if param in ("wldev", "dhcpd_lease"):
-                        self.last_results[param] = json.loads(value.replace("'", '"'))
-                return True
-
-            if response.status_code == HTTPStatus.UNAUTHORIZED:
-                # Authentication error
-                _LOGGER.exception(
-                    "Failed to authenticate, please check your username and password"
-                )
-                return False
-
-        except requests.exceptions.ConnectionError:
-            # We get this if we could not connect to the router or
-            # an invalid http_id was supplied.
-            _LOGGER.exception(
-                "Failed to connect to the router or invalid http_id supplied"
-            )
-            return False
-
-        except requests.exceptions.Timeout:
-            # We get this if we could not connect to the router or
-            # an invalid http_id was supplied.
-            _LOGGER.exception("Connection to the router timed out")
-            return False
-
-        except ValueError:
-            # If JSON decoder could not parse the response.
-            _LOGGER.exception("Failed to parse response from router")
-            return False
+    @property
+    @override
+    def hostname(self) -> str | None:
+        """Return the hostname of the device."""
+        if device := self.coordinator.data.get(self._mac):
+            return device.hostname
+        return None

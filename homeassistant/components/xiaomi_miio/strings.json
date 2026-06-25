@@ -589,5 +589,11 @@
       "description": "Stops remote control mode of the vacuum cleaner.",
       "name": "Vacuum remote control stop"
     }
+  },
+  "issues": {
+    "deprecated_yaml_device_tracker": {
+      "description": "Configuring the {integration_title} device tracker through YAML is deprecated. The integration now requires setup through the UI with a config entry for your Xiaomi Mi WiFi Repeater.\n\nSet up the integration through the UI, then remove the `{domain}` device_tracker entry from your `configuration.yaml` file and restart Home Assistant.",
+      "title": "The {integration_title} YAML device tracker configuration is being removed"
+    }
   }
 }

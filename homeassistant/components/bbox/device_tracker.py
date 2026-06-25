@@ -1,99 +1,136 @@
-"""Support for French FAI Bouygues Bbox routers."""
+"""Support for French FAI Bouygues Bbox router device tracking using a coordinator."""
 
-from collections import namedtuple
-from datetime import timedelta
-import logging
 from typing import override
 
-import pybbox
 import voluptuous as vol
 
 from homeassistant.components.device_tracker import (
-    DOMAIN as DEVICE_TRACKER_DOMAIN,
     PLATFORM_SCHEMA as DEVICE_TRACKER_PLATFORM_SCHEMA,
-    DeviceScanner,
+    AsyncSeeCallback,
+    ScannerEntity,
 )
+from homeassistant.config_entries import SOURCE_IMPORT
 from homeassistant.const import CONF_HOST
-from homeassistant.core import HomeAssistant
-from homeassistant.helpers import config_validation as cv
-from homeassistant.helpers.typing import ConfigType
-from homeassistant.util import Throttle, dt as dt_util
+from homeassistant.core import DOMAIN as HOMEASSISTANT_DOMAIN, HomeAssistant, callback
+from homeassistant.data_entry_flow import FlowResultType
+from homeassistant.helpers import config_validation as cv, issue_registry as ir
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
+from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
+from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-_LOGGER = logging.getLogger(__name__)
-
-DEFAULT_HOST = "192.168.1.254"
-
-MIN_TIME_BETWEEN_SCANS = timedelta(seconds=60)
+from .const import DEFAULT_HOST, DOMAIN, Device
+from .coordinator import BboxConfigEntry, BboxDataUpdateCoordinator
 
 PLATFORM_SCHEMA = DEVICE_TRACKER_PLATFORM_SCHEMA.extend(
     {vol.Optional(CONF_HOST, default=DEFAULT_HOST): cv.string}
 )
 
 
-def get_scanner(hass: HomeAssistant, config: ConfigType) -> BboxDeviceScanner | None:
-    """Validate the configuration and return a Bbox scanner."""
-    scanner = BboxDeviceScanner(config[DEVICE_TRACKER_DOMAIN])
+async def async_setup_scanner(
+    hass: HomeAssistant,
+    config: ConfigType,
+    _async_see: AsyncSeeCallback,
+    _discovery_info: DiscoveryInfoType | None = None,
+) -> bool:
+    """Set up the legacy Bbox device tracker."""
+    import_data = {CONF_HOST: config.get(CONF_HOST, DEFAULT_HOST)}
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": SOURCE_IMPORT}, data=import_data
+    )
 
-    return scanner if scanner.success_init else None
+    if result["type"] is FlowResultType.ABORT and result["reason"] == "cannot_connect":
+        ir.async_create_issue(
+            hass,
+            DOMAIN,
+            "yaml_import_cannot_connect",
+            is_fixable=False,
+            issue_domain=DOMAIN,
+            severity=ir.IssueSeverity.ERROR,
+            translation_key="yaml_import_cannot_connect",
+            translation_placeholders={"host": import_data[CONF_HOST]},
+        )
+        return False
+
+    ir.async_delete_issue(hass, DOMAIN, "yaml_import_cannot_connect")
+    ir.async_create_issue(
+        hass,
+        HOMEASSISTANT_DOMAIN,
+        f"deprecated_yaml_{DOMAIN}",
+        is_fixable=False,
+        issue_domain=DOMAIN,
+        severity=ir.IssueSeverity.WARNING,
+        translation_key="deprecated_yaml",
+        translation_placeholders={
+            "domain": DOMAIN,
+            "integration_title": "Bbox",
+        },
+    )
+    return True
 
 
-Device = namedtuple("Device", ["mac", "name", "ip", "last_update"])  # noqa: PYI024
+async def async_setup_entry(
+    hass: HomeAssistant,
+    config_entry: BboxConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
+) -> None:
+    """Set up the Bbox device tracker from a config entry."""
+    coordinator = config_entry.runtime_data
+    tracked: set[str] = set()
+
+    @callback
+    def _async_add_new_devices() -> None:
+        """Add newly discovered devices from the coordinator."""
+        new_entities: list[BboxScannerEntity] = []
+        for mac in coordinator.data:
+            if mac not in tracked:
+                tracked.add(mac)
+                new_entities.append(BboxScannerEntity(coordinator, mac))
+        if new_entities:
+            async_add_entities(new_entities)
+
+    config_entry.async_on_unload(coordinator.async_add_listener(_async_add_new_devices))
+    _async_add_new_devices()
 
 
-class BboxDeviceScanner(DeviceScanner):
-    """Scanner for devices connected to the bbox."""
+class BboxScannerEntity(CoordinatorEntity[BboxDataUpdateCoordinator], ScannerEntity):
+    """Representation of a device connected to the Bbox router."""
 
-    def __init__(self, config):
-        """Get host from config."""
+    def __init__(self, coordinator: BboxDataUpdateCoordinator, mac: str) -> None:
+        """Initialize the tracked device."""
+        super().__init__(coordinator)
+        self._mac = mac
+        device = coordinator.data.get(mac)
+        self._attr_name = (device.name if device else None) or mac
 
-        self.host = config[CONF_HOST]
+    @property
+    def _device(self) -> Device | None:
+        """Return the current device data."""
+        return self.coordinator.data.get(self._mac)
 
-        """Initialize the scanner."""
-        self.last_results: list[Device] = []
-
-        self.success_init = self._update_info()
-
+    @property
     @override
-    def scan_devices(self):
-        """Scan for new devices and return a list with found device IDs."""
-        self._update_info()
+    def is_connected(self) -> bool:
+        """Return true if the device is connected to the Bbox router."""
+        return self._mac in self.coordinator.data
 
-        return [device.mac for device in self.last_results]
-
+    @property
     @override
-    def get_device_name(self, device):
-        """Return the name of the given device or None if we don't know."""
-        filter_named = [
-            result.name for result in self.last_results if result.mac == device
-        ]
+    def mac_address(self) -> str:
+        """Return the MAC address of the device."""
+        return self._mac
 
-        if filter_named:
-            return filter_named[0]
+    @property
+    @override
+    def ip_address(self) -> str | None:
+        """Return the IP address of the device."""
+        if (device := self._device) is not None:
+            return device.ip
         return None
 
-    @Throttle(MIN_TIME_BETWEEN_SCANS)
-    def _update_info(self):
-        """Check the Bbox for devices.
-
-        Returns boolean if scanning successful.
-        """
-        _LOGGER.debug("Scanning")
-
-        box = pybbox.Bbox(ip=self.host)
-        result = box.get_all_connected_devices()
-
-        now = dt_util.now()
-        last_results = []
-        for device in result:
-            if device["active"] != 1:
-                continue
-            last_results.append(
-                Device(
-                    device["macaddress"], device["hostname"], device["ipaddress"], now
-                )
-            )
-
-        self.last_results = last_results
-
-        _LOGGER.debug("Scan successful")
-        return True
+    @property
+    @override
+    def hostname(self) -> str | None:
+        """Return the hostname of the device."""
+        if (device := self._device) is not None:
+            return device.name
+        return None

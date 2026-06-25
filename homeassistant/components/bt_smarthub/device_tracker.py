@@ -1,102 +1,142 @@
-"""Support for BT Smart Hub (Sometimes referred to as BT Home Hub 6)."""
+"""Support for BT Smart Hub device tracking."""
 
-from collections import namedtuple
-import logging
 from typing import override
 
-from btsmarthub_devicelist import BTSmartHub
 import voluptuous as vol
 
 from homeassistant.components.device_tracker import (
-    DOMAIN as DEVICE_TRACKER_DOMAIN,
     PLATFORM_SCHEMA as DEVICE_TRACKER_PLATFORM_SCHEMA,
-    DeviceScanner,
+    AsyncSeeCallback,
+    ScannerEntity,
 )
+from homeassistant.config_entries import SOURCE_IMPORT
 from homeassistant.const import CONF_HOST
-from homeassistant.core import HomeAssistant
-from homeassistant.helpers import config_validation as cv
-from homeassistant.helpers.typing import ConfigType
+from homeassistant.core import DOMAIN as HOMEASSISTANT_DOMAIN, HomeAssistant, callback
+from homeassistant.data_entry_flow import FlowResultType
+from homeassistant.helpers import config_validation as cv, issue_registry as ir
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
+from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
+from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-_LOGGER = logging.getLogger(__name__)
-
-CONF_DEFAULT_IP = "192.168.1.254"
-CONF_SMARTHUB_MODEL = "smarthub_model"
+from .const import CONF_SMARTHUB_MODEL, DEFAULT_HOST, DOMAIN
+from .coordinator import BTSmartHubConfigEntry, BTSmartHubDataUpdateCoordinator
 
 PLATFORM_SCHEMA = DEVICE_TRACKER_PLATFORM_SCHEMA.extend(
     {
-        vol.Optional(CONF_HOST, default=CONF_DEFAULT_IP): cv.string,
+        vol.Optional(CONF_HOST, default=DEFAULT_HOST): cv.string,
         vol.Optional(CONF_SMARTHUB_MODEL): vol.In([1, 2]),
     }
 )
 
 
-def get_scanner(hass: HomeAssistant, config: ConfigType) -> BTSmartHubScanner | None:
-    """Return a BT Smart Hub scanner if successful."""
-    info = config[DEVICE_TRACKER_DOMAIN]
-    smarthub_client = BTSmartHub(
-        router_ip=info[CONF_HOST], smarthub_model=info.get(CONF_SMARTHUB_MODEL)
+async def async_setup_scanner(
+    hass: HomeAssistant,
+    config: ConfigType,
+    _async_see: AsyncSeeCallback,
+    _discovery_info: DiscoveryInfoType | None = None,
+) -> bool:
+    """Set up the legacy BT Smart Hub device tracker."""
+    import_data: dict = {CONF_HOST: config.get(CONF_HOST, DEFAULT_HOST)}
+    if CONF_SMARTHUB_MODEL in config:
+        import_data[CONF_SMARTHUB_MODEL] = config[CONF_SMARTHUB_MODEL]
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": SOURCE_IMPORT}, data=import_data
     )
-    scanner = BTSmartHubScanner(smarthub_client)
-    return scanner if scanner.success_init else None
+
+    if result["type"] is FlowResultType.ABORT and result["reason"] == "cannot_connect":
+        ir.async_create_issue(
+            hass,
+            DOMAIN,
+            "yaml_import_cannot_connect",
+            is_fixable=False,
+            issue_domain=DOMAIN,
+            severity=ir.IssueSeverity.ERROR,
+            translation_key="yaml_import_cannot_connect",
+            translation_placeholders={"host": import_data[CONF_HOST]},
+        )
+        return False
+
+    ir.async_delete_issue(hass, DOMAIN, "yaml_import_cannot_connect")
+    ir.async_create_issue(
+        hass,
+        HOMEASSISTANT_DOMAIN,
+        f"deprecated_yaml_{DOMAIN}",
+        is_fixable=False,
+        issue_domain=DOMAIN,
+        severity=ir.IssueSeverity.WARNING,
+        translation_key="deprecated_yaml",
+        translation_placeholders={
+            "domain": DOMAIN,
+            "integration_title": "BT Smart Hub",
+        },
+    )
+    return True
 
 
-def _create_device(data):
-    """Create new device from the dict."""
-    ip_address = data.get("IPAddress")
-    mac = data.get("PhysAddress")
-    host = data.get("UserHostName")
-    status = data.get("Active")
-    name = data.get("name")
-    return _Device(ip_address, mac, host, status, name)
+async def async_setup_entry(
+    hass: HomeAssistant,
+    config_entry: BTSmartHubConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
+) -> None:
+    """Set up the BT Smart Hub device tracker from a config entry."""
+    coordinator = config_entry.runtime_data
+    tracked: set[str] = set()
+
+    @callback
+    def _async_add_new_devices() -> None:
+        """Add newly discovered devices from the coordinator."""
+        new_entities: list[BTSmartHubScannerEntity] = []
+        for mac in coordinator.data:
+            if mac not in tracked:
+                tracked.add(mac)
+                new_entities.append(BTSmartHubScannerEntity(coordinator, mac))
+        if new_entities:
+            async_add_entities(new_entities)
+
+    config_entry.async_on_unload(coordinator.async_add_listener(_async_add_new_devices))
+    _async_add_new_devices()
 
 
-_Device = namedtuple("_Device", ["ip_address", "mac", "host", "status", "name"])  # noqa: PYI024
+class BTSmartHubScannerEntity(
+    CoordinatorEntity[BTSmartHubDataUpdateCoordinator], ScannerEntity
+):
+    """Representation of a device connected to the BT Smart Hub."""
 
+    def __init__(
+        self, coordinator: BTSmartHubDataUpdateCoordinator, mac: str
+    ) -> None:
+        """Initialize the tracked device."""
+        super().__init__(coordinator)
+        self._mac = mac
+        device = coordinator.data.get(mac)
+        self._attr_name = (
+            (device.name or device.host) if device else None
+        ) or mac
 
-class BTSmartHubScanner(DeviceScanner):
-    """Class which queries a BT Smart Hub."""
-
-    def __init__(self, smarthub_client):
-        """Initialise the scanner."""
-        self.smarthub = smarthub_client
-        self.last_results = []
-        self.success_init = False
-
-        # Test the router is accessible
-        if self.get_bt_smarthub_data():
-            self.success_init = True
-        else:
-            _LOGGER.warning("Failed to connect to %s", self.smarthub.router_ip)
-
+    @property
     @override
-    def scan_devices(self):
-        """Scan for new devices and return a list with found device IDs."""
-        self._update_info()
-        return [device.mac for device in self.last_results]
+    def is_connected(self) -> bool:
+        """Return true if the device is connected."""
+        return self._mac in self.coordinator.data
 
+    @property
     @override
-    def get_device_name(self, device):
-        """Return the name of the given device or None if we don't know."""
-        if not self.last_results:
-            return None
-        for result_device in self.last_results:
-            if result_device.mac == device:
-                return result_device.name or result_device.host
+    def mac_address(self) -> str:
+        """Return the MAC address of the device."""
+        return self._mac
+
+    @property
+    @override
+    def ip_address(self) -> str | None:
+        """Return the IP address of the device."""
+        if device := self.coordinator.data.get(self._mac):
+            return device.ip_address
         return None
 
-    def _update_info(self):
-        """Ensure the information from the BT Smart Hub is up to date."""
-        if not self.success_init:
-            return
-
-        _LOGGER.debug("Scanning")
-        if not (data := self.get_bt_smarthub_data()):
-            _LOGGER.warning("Error scanning devices")
-            return
-        self.last_results = data
-
-    def get_bt_smarthub_data(self):
-        """Retrieve data from BT Smart Hub and return parsed result."""
-        # Request data from bt smarthub into a list of dicts.
-        data = self.smarthub.get_devicelist(only_active_devices=True)
-        return [_create_device(d) for d in data if d.get("PhysAddress")]
+    @property
+    @override
+    def hostname(self) -> str | None:
+        """Return the hostname of the device."""
+        if device := self.coordinator.data.get(self._mac):
+            return device.name or device.host
+        return None

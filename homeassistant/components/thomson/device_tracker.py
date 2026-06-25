@@ -1,33 +1,25 @@
 """Support for THOMSON routers."""
 
-import logging
-import re
 from typing import override
 
-import telnetlib  # pylint: disable=deprecated-module
 import voluptuous as vol
 
 from homeassistant.components.device_tracker import (
-    DOMAIN as DEVICE_TRACKER_DOMAIN,
     PLATFORM_SCHEMA as DEVICE_TRACKER_PLATFORM_SCHEMA,
-    DeviceScanner,
+    AsyncSeeCallback,
+    ScannerEntity,
 )
+from homeassistant.config_entries import SOURCE_IMPORT
 from homeassistant.const import CONF_HOST, CONF_PASSWORD, CONF_USERNAME
-from homeassistant.core import HomeAssistant
-from homeassistant.helpers import config_validation as cv
-from homeassistant.helpers.typing import ConfigType
+from homeassistant.core import DOMAIN as HOMEASSISTANT_DOMAIN, HomeAssistant, callback
+from homeassistant.data_entry_flow import FlowResultType
+from homeassistant.helpers import config_validation as cv, issue_registry as ir
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
+from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
+from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-_LOGGER = logging.getLogger(__name__)
-
-_DEVICES_REGEX = re.compile(
-    r"(?P<mac>(([0-9a-f]{2}[:-]){5}([0-9a-f]{2})))\s"
-    r"(?P<ip>([0-9]{1,3}[\.]){3}[0-9]{1,3})\s+"
-    r"(?P<status>([^\s]+))\s+"
-    r"(?P<type>([^\s]+))\s+"
-    r"(?P<intf>([^\s]+))\s+"
-    r"(?P<hwintf>([^\s]+))\s+"
-    r"(?P<host>([^\s]+))"
-)
+from .const import DOMAIN
+from .coordinator import ThomsonConfigEntry, ThomsonDataUpdateCoordinator
 
 PLATFORM_SCHEMA = DEVICE_TRACKER_PLATFORM_SCHEMA.extend(
     {
@@ -38,88 +30,112 @@ PLATFORM_SCHEMA = DEVICE_TRACKER_PLATFORM_SCHEMA.extend(
 )
 
 
-def get_scanner(hass: HomeAssistant, config: ConfigType) -> ThomsonDeviceScanner | None:
-    """Validate the configuration and return a THOMSON scanner."""
-    scanner = ThomsonDeviceScanner(config[DEVICE_TRACKER_DOMAIN])
+async def async_setup_scanner(
+    hass: HomeAssistant,
+    config: ConfigType,
+    _async_see: AsyncSeeCallback,
+    _discovery_info: DiscoveryInfoType | None = None,
+) -> bool:
+    """Set up the legacy Thomson device tracker."""
+    import_data = {
+        CONF_HOST: config[CONF_HOST],
+        CONF_USERNAME: config[CONF_USERNAME],
+        CONF_PASSWORD: config[CONF_PASSWORD],
+    }
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": SOURCE_IMPORT}, data=import_data
+    )
 
-    return scanner if scanner.success_init else None
+    if result["type"] is FlowResultType.ABORT and result["reason"] == "cannot_connect":
+        ir.async_create_issue(
+            hass,
+            DOMAIN,
+            "yaml_import_cannot_connect",
+            is_fixable=False,
+            issue_domain=DOMAIN,
+            severity=ir.IssueSeverity.ERROR,
+            translation_key="yaml_import_cannot_connect",
+            translation_placeholders={"host": import_data[CONF_HOST]},
+        )
+        return False
+
+    ir.async_delete_issue(hass, DOMAIN, "yaml_import_cannot_connect")
+    ir.async_create_issue(
+        hass,
+        HOMEASSISTANT_DOMAIN,
+        f"deprecated_yaml_{DOMAIN}",
+        is_fixable=False,
+        issue_domain=DOMAIN,
+        severity=ir.IssueSeverity.WARNING,
+        translation_key="deprecated_yaml",
+        translation_placeholders={
+            "domain": DOMAIN,
+            "integration_title": "Thomson",
+        },
+    )
+    return True
 
 
-class ThomsonDeviceScanner(DeviceScanner):
-    """Class which queries a router running THOMSON firmware."""
+async def async_setup_entry(
+    hass: HomeAssistant,
+    config_entry: ThomsonConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
+) -> None:
+    """Set up the Thomson device tracker from a config entry."""
+    coordinator = config_entry.runtime_data
+    tracked: set[str] = set()
 
-    def __init__(self, config):
-        """Initialize the scanner."""
-        self.host = config[CONF_HOST]
-        self.username = config[CONF_USERNAME]
-        self.password = config[CONF_PASSWORD]
-        self.last_results = {}
+    @callback
+    def _async_add_new_devices() -> None:
+        """Add newly discovered devices from the coordinator."""
+        new_entities: list[ThomsonScannerEntity] = []
+        for mac in coordinator.data:
+            if mac not in tracked:
+                tracked.add(mac)
+                new_entities.append(ThomsonScannerEntity(coordinator, mac))
+        if new_entities:
+            async_add_entities(new_entities)
 
-        # Test the router is accessible.
-        data = self.get_thomson_data()
-        self.success_init = data is not None
+    config_entry.async_on_unload(coordinator.async_add_listener(_async_add_new_devices))
+    _async_add_new_devices()
 
+
+class ThomsonScannerEntity(
+    CoordinatorEntity[ThomsonDataUpdateCoordinator], ScannerEntity
+):
+    """Representation of a device connected to the Thomson router."""
+
+    def __init__(self, coordinator: ThomsonDataUpdateCoordinator, mac: str) -> None:
+        """Initialize the tracked device."""
+        super().__init__(coordinator)
+        self._mac = mac
+        device = coordinator.data.get(mac)
+        self._attr_name = (device.host if device else None) or mac
+
+    @property
     @override
-    def scan_devices(self):
-        """Scan for new devices and return a list with found device IDs."""
-        self._update_info()
-        return [client["mac"] for client in self.last_results]
+    def is_connected(self) -> bool:
+        """Return true if the device is connected."""
+        return self._mac in self.coordinator.data
 
+    @property
     @override
-    def get_device_name(self, device):
-        """Return the name of the given device or None if we don't know."""
-        if not self.last_results:
-            return None
-        for client in self.last_results:
-            if client["mac"] == device:
-                return client["host"]
+    def mac_address(self) -> str:
+        """Return the MAC address of the device."""
+        return self._mac
+
+    @property
+    @override
+    def ip_address(self) -> str | None:
+        """Return the IP address of the device."""
+        if device := self.coordinator.data.get(self._mac):
+            return device.ip
         return None
 
-    def _update_info(self):
-        """Ensure the information from the THOMSON router is up to date.
-
-        Return boolean if scanning successful.
-        """
-        if not self.success_init:
-            return False
-
-        _LOGGER.debug("Checking ARP")
-        if not (data := self.get_thomson_data()):
-            return False
-
-        # Flag C stands for CONNECTED
-        active_clients = [
-            client for client in data.values() if client["status"].find("C") != -1
-        ]
-        self.last_results = active_clients
-        return True
-
-    def get_thomson_data(self):
-        """Retrieve data from THOMSON and return parsed result."""
-        try:
-            telnet = telnetlib.Telnet(self.host)
-            telnet.read_until(b"Username : ")
-            telnet.write((self.username + "\r\n").encode("ascii"))
-            telnet.read_until(b"Password : ")
-            telnet.write((self.password + "\r\n").encode("ascii"))
-            telnet.read_until(b"=>")
-            telnet.write(b"hostmgr list\r\n")
-            devices_result = telnet.read_until(b"=>").split(b"\r\n")
-            telnet.write(b"exit\r\n")
-        except EOFError:
-            _LOGGER.exception("Unexpected response from router")
-            return None
-        except ConnectionRefusedError:
-            _LOGGER.exception("Connection refused by router. Telnet enabled?")
-            return None
-
-        devices = {}
-        for device in devices_result:
-            if match := _DEVICES_REGEX.search(device.decode("utf-8")):
-                devices[match.group("ip")] = {
-                    "ip": match.group("ip"),
-                    "mac": match.group("mac").upper(),
-                    "host": match.group("host"),
-                    "status": match.group("status"),
-                }
-        return devices
+    @property
+    @override
+    def hostname(self) -> str | None:
+        """Return the hostname of the device."""
+        if device := self.coordinator.data.get(self._mac):
+            return device.host
+        return None

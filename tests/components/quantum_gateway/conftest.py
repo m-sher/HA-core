@@ -1,33 +1,57 @@
-"""Fixtures for Quantum Gateway tests."""
+"""Common fixtures for the Quantum Gateway integration tests."""
 
 from collections.abc import Generator
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from homeassistant.components.quantum_gateway.const import DOMAIN
+from homeassistant.const import CONF_HOST, CONF_PASSWORD, CONF_SSL
+
+from tests.common import MockConfigEntry
+
+MOCK_HOST = "myfiosgateway.com"
+MOCK_PASSWORD = "password"
+
+MOCK_CONFIG = {
+    CONF_HOST: MOCK_HOST,
+    CONF_PASSWORD: MOCK_PASSWORD,
+    CONF_SSL: True,
+}
+
+MOCK_DEVICES = {
+    "FF:FF:FF:FF:FF:FE": "desktop",
+    "FF:FF:FF:FF:FF:FF": "",
+}
+
 
 @pytest.fixture
-def hass_config_dir(hass_tmp_config_dir: str) -> str:
-    """Use temporary config directory for device_tracker tests.
-
-    This fixture can be removed when the legacy YAML writing has been removed
-    from the device tracker integration.
-    """
-    return hass_tmp_config_dir
-
-
-@pytest.fixture
-async def mock_scanner() -> Generator[AsyncMock]:
-    """Mock QuantumGatewayScanner instance."""
+def mock_setup_entry() -> Generator[AsyncMock]:
+    """Override async_setup_entry."""
     with patch(
-        "homeassistant.components.quantum_gateway.device_tracker.QuantumGatewayScanner",
-        autospec=True,
-    ) as mock_scanner:
-        client = mock_scanner.return_value
-        client.success_init = True
-        client.scan_devices.return_value = ["ff:ff:ff:ff:ff:ff", "ff:ff:ff:ff:ff:fe"]
-        client.get_device_name.side_effect = {
-            "ff:ff:ff:ff:ff:ff": "",
-            "ff:ff:ff:ff:ff:fe": "desktop",
-        }.get
-        yield mock_scanner
+        "homeassistant.components.quantum_gateway.async_setup_entry", return_value=True
+    ) as mock_setup_entry:
+        yield mock_setup_entry
+
+
+@pytest.fixture
+def mock_config_entry() -> MockConfigEntry:
+    """Return a mock config entry."""
+    return MockConfigEntry(domain=DOMAIN, data=MOCK_CONFIG, title=MOCK_HOST)
+
+
+@pytest.fixture
+def mock_get_quantum_gateway_data() -> Generator[MagicMock]:
+    """Mock Quantum Gateway data fetching."""
+    mock_get_data = MagicMock(return_value=MOCK_DEVICES)
+    with (
+        patch(
+            "homeassistant.components.quantum_gateway.coordinator.get_quantum_gateway_data",
+            new=mock_get_data,
+        ),
+        patch(
+            "homeassistant.components.quantum_gateway.config_flow.get_quantum_gateway_data",
+            new=mock_get_data,
+        ),
+    ):
+        yield mock_get_data

@@ -1,22 +1,23 @@
-"""Support for Xiaomi Mi WiFi Repeater 2."""
+"""Support for Xiaomi Mi WiFi Repeater device tracking."""
 
-import logging
-from typing import override
+from typing import Any, override
 
-from miio import DeviceException, WifiRepeater
 import voluptuous as vol
 
 from homeassistant.components.device_tracker import (
-    DOMAIN as DEVICE_TRACKER_DOMAIN,
     PLATFORM_SCHEMA as DEVICE_TRACKER_PLATFORM_SCHEMA,
-    DeviceScanner,
+    AsyncSeeCallback,
+    ScannerEntity,
 )
 from homeassistant.const import CONF_HOST, CONF_TOKEN
-from homeassistant.core import HomeAssistant
-from homeassistant.helpers import config_validation as cv
-from homeassistant.helpers.typing import ConfigType
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers import config_validation as cv, issue_registry as ir
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
+from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
+from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-_LOGGER = logging.getLogger(__name__)
+from .const import DOMAIN
+from .typing import XiaomiMiioConfigEntry
 
 PLATFORM_SCHEMA = DEVICE_TRACKER_PLATFORM_SCHEMA.extend(
     {
@@ -26,57 +27,93 @@ PLATFORM_SCHEMA = DEVICE_TRACKER_PLATFORM_SCHEMA.extend(
 )
 
 
-def get_scanner(
-    hass: HomeAssistant, config: ConfigType
-) -> XiaomiMiioDeviceScanner | None:
-    """Return a Xiaomi MiIO device scanner."""
-    scanner = None
-    config = config[DEVICE_TRACKER_DOMAIN]
-
-    host = config[CONF_HOST]
-    token = config[CONF_TOKEN]
-
-    _LOGGER.debug("Initializing with host %s (token %s...)", host, token[:5])
-
-    try:
-        device = WifiRepeater(host, token)
-        device_info = device.info()
-        _LOGGER.debug(
-            "%s %s %s detected",
-            device_info.model,
-            device_info.firmware_version,
-            device_info.hardware_version,
-        )
-        scanner = XiaomiMiioDeviceScanner(device)
-    except DeviceException as ex:
-        _LOGGER.error("Device unavailable or token incorrect: %s", ex)
-
-    return scanner
+async def async_setup_scanner(
+    hass: HomeAssistant,
+    config: ConfigType,
+    async_see: AsyncSeeCallback,
+    discovery_info: DiscoveryInfoType | None = None,
+) -> bool:
+    """Inform users that the YAML configuration is no longer supported."""
+    ir.async_create_issue(
+        hass,
+        DOMAIN,
+        "deprecated_yaml_device_tracker",
+        breaks_in_ha_version="2027.1.0",
+        is_fixable=False,
+        is_persistent=False,
+        issue_domain=DOMAIN,
+        severity=ir.IssueSeverity.WARNING,
+        translation_key="deprecated_yaml_device_tracker",
+        translation_placeholders={
+            "domain": DOMAIN,
+            "integration_title": "Xiaomi Miio",
+        },
+    )
+    return False
 
 
-class XiaomiMiioDeviceScanner(DeviceScanner):
-    """Class which queries a Xiaomi Mi WiFi Repeater."""
+async def async_setup_entry(
+    hass: HomeAssistant,
+    config_entry: XiaomiMiioConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
+) -> None:
+    """Set up device tracker entities for Xiaomi Mi WiFi Repeater."""
+    coordinator = config_entry.runtime_data.device_coordinator
+    tracked: set[str] = set()
 
-    def __init__(self, device):
-        """Initialize the scanner."""
-        self.device = device
+    @callback
+    def _async_add_new_devices() -> None:
+        """Add newly discovered devices from the coordinator."""
+        if coordinator.data is None:
+            return
+        stations = coordinator.data.associated_stations
+        new_entities: list[XiaomiMiioScannerEntity] = []
+        for station in stations:
+            mac = station["mac"]
+            if mac not in tracked:
+                tracked.add(mac)
+                new_entities.append(XiaomiMiioScannerEntity(coordinator, mac))
+        if new_entities:
+            async_add_entities(new_entities)
 
+    config_entry.async_on_unload(coordinator.async_add_listener(_async_add_new_devices))
+    _async_add_new_devices()
+
+
+class XiaomiMiioScannerEntity(CoordinatorEntity, ScannerEntity):
+    """Representation of a device connected to a Xiaomi Mi WiFi Repeater."""
+
+    def __init__(self, coordinator, mac: str) -> None:
+        """Initialize the tracked device."""
+        super().__init__(coordinator)
+        self._mac = mac
+        self._attr_name = mac
+
+    def _get_station(self) -> dict[str, Any] | None:
+        """Return station data for this MAC if present."""
+        if self.coordinator.data is None:
+            return None
+        for station in self.coordinator.data.associated_stations:
+            if station["mac"] == self._mac:
+                return station
+        return None
+
+    @property
     @override
-    async def async_scan_devices(self):
-        """Scan for devices and return a list containing found device IDs."""
-        try:
-            station_info = await self.hass.async_add_executor_job(self.device.status)
-            _LOGGER.debug("Got new station info: %s", station_info)
-        except DeviceException as ex:
-            _LOGGER.error("Unable to fetch the state: %s", ex)
-            return []
+    def is_connected(self) -> bool:
+        """Return true if the device is connected to the repeater."""
+        return self._get_station() is not None
 
-        return [device["mac"] for device in station_info.associated_stations]
-
+    @property
     @override
-    async def async_get_device_name(self, device: str) -> str | None:
-        """Return None.
+    def mac_address(self) -> str:
+        """Return the MAC address of the device."""
+        return self._mac
 
-        The repeater doesn't provide the name of the associated device.
-        """
+    @property
+    @override
+    def ip_address(self) -> str | None:
+        """Return the IP address of the device."""
+        if station := self._get_station():
+            return station.get("ip")
         return None

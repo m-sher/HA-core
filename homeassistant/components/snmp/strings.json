@@ -1,0 +1,33 @@
+{
+  "config": {
+    "abort": {
+      "already_configured": "[%key:common::config_flow::abort::already_configured_device%]"
+    },
+    "error": {
+      "cannot_connect": "[%key:common::config_flow::error::cannot_connect%]"
+    },
+    "step": {
+      "user": {
+        "data": {
+          "auth_key": "Authentication key",
+          "baseoid": "Base OID",
+          "community": "Community",
+          "host": "[%key:common::config_flow::data::host%]",
+          "priv_key": "Privacy key"
+        },
+        "data_description": {
+          "auth_key": "SNMPv3 authentication key. Leave empty for SNMPv1/v2c.",
+          "baseoid": "The SNMP base OID to walk for MAC addresses.",
+          "community": "SNMP community string (v1/v2c) or SNMPv3 username.",
+          "priv_key": "SNMPv3 privacy key. Leave empty for SNMPv1/v2c."
+        }
+      }
+    }
+  },
+  "issues": {
+    "yaml_import_cannot_connect": {
+      "description": "The YAML configuration for SNMP at `{host}` could not be imported because the connection failed.\n\nPlease check that `{host}` is reachable, update your `configuration.yaml` if needed, and restart Home Assistant.",
+      "title": "YAML configuration import failed: cannot connect"
+    }
+  }
+}

@@ -1,29 +1,25 @@
 """Support for Aruba Access Points."""
 
-import logging
-import re
-from typing import Any, override
+from typing import override
 
-import pexpect
 import voluptuous as vol
 
 from homeassistant.components.device_tracker import (
-    DOMAIN as DEVICE_TRACKER_DOMAIN,
     PLATFORM_SCHEMA as DEVICE_TRACKER_PLATFORM_SCHEMA,
-    DeviceScanner,
+    AsyncSeeCallback,
+    ScannerEntity,
 )
+from homeassistant.config_entries import SOURCE_IMPORT
 from homeassistant.const import CONF_HOST, CONF_PASSWORD, CONF_USERNAME
-from homeassistant.core import HomeAssistant
-from homeassistant.helpers import config_validation as cv
-from homeassistant.helpers.typing import ConfigType
+from homeassistant.core import DOMAIN as HOMEASSISTANT_DOMAIN, HomeAssistant, callback
+from homeassistant.data_entry_flow import FlowResultType
+from homeassistant.helpers import config_validation as cv, issue_registry as ir
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
+from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
+from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-_LOGGER = logging.getLogger(__name__)
-
-_DEVICES_REGEX = re.compile(
-    r"(?P<name>([^\s]+)?)\s+"
-    r"(?P<ip>([0-9]{1,3}[\.]){3}[0-9]{1,3})\s+"
-    r"(?P<mac>([0-9a-f]{2}[:-]){5}([0-9a-f]{2}))\s+"
-)
+from .const import DOMAIN
+from .coordinator import ArubaConfigEntry, ArubaDataUpdateCoordinator
 
 PLATFORM_SCHEMA = DEVICE_TRACKER_PLATFORM_SCHEMA.extend(
     {
@@ -34,106 +30,114 @@ PLATFORM_SCHEMA = DEVICE_TRACKER_PLATFORM_SCHEMA.extend(
 )
 
 
-def get_scanner(hass: HomeAssistant, config: ConfigType) -> ArubaDeviceScanner | None:
-    """Validate the configuration and return a Aruba scanner."""
-    scanner = ArubaDeviceScanner(config[DEVICE_TRACKER_DOMAIN])
+async def async_setup_scanner(
+    hass: HomeAssistant,
+    config: ConfigType,
+    _async_see: AsyncSeeCallback,
+    _discovery_info: DiscoveryInfoType | None = None,
+) -> bool:
+    """Set up the legacy Aruba device tracker."""
+    import_data = {
+        CONF_HOST: config[CONF_HOST],
+        CONF_USERNAME: config[CONF_USERNAME],
+        CONF_PASSWORD: config[CONF_PASSWORD],
+    }
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": SOURCE_IMPORT}, data=import_data
+    )
 
-    return scanner if scanner.success_init else None
+    if result["type"] is FlowResultType.ABORT and result["reason"] == "cannot_connect":
+        ir.async_create_issue(
+            hass,
+            DOMAIN,
+            "yaml_import_cannot_connect",
+            is_fixable=False,
+            issue_domain=DOMAIN,
+            severity=ir.IssueSeverity.ERROR,
+            translation_key="yaml_import_cannot_connect",
+            translation_placeholders={"host": import_data[CONF_HOST]},
+        )
+        return False
+
+    ir.async_delete_issue(hass, DOMAIN, "yaml_import_cannot_connect")
+    ir.async_create_issue(
+        hass,
+        HOMEASSISTANT_DOMAIN,
+        f"deprecated_yaml_{DOMAIN}",
+        is_fixable=False,
+        issue_domain=DOMAIN,
+        severity=ir.IssueSeverity.WARNING,
+        translation_key="deprecated_yaml",
+        translation_placeholders={
+            "domain": DOMAIN,
+            "integration_title": "Aruba",
+        },
+    )
+    return True
 
 
-class ArubaDeviceScanner(DeviceScanner):
-    """Class which queries a Aruba Access Point for connected devices."""
+async def async_setup_entry(
+    hass: HomeAssistant,
+    config_entry: ArubaConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
+) -> None:
+    """Set up the Aruba device tracker from a config entry."""
+    coordinator = config_entry.runtime_data
+    tracked: set[str] = set()
 
-    def __init__(self, config: dict[str, Any]) -> None:
-        """Initialize the scanner."""
-        self.host: str = config[CONF_HOST]
-        self.username: str = config[CONF_USERNAME]
-        self.password: str = config[CONF_PASSWORD]
+    @callback
+    def _async_add_new_devices() -> None:
+        """Add newly discovered devices from the coordinator."""
+        new_entities: list[ArubaScannerEntity] = []
+        for mac in coordinator.data:
+            if mac not in tracked:
+                tracked.add(mac)
+                new_entities.append(ArubaScannerEntity(coordinator, mac))
+        if new_entities:
+            async_add_entities(new_entities)
 
-        self.last_results: dict[str, dict[str, str]] = {}
+    config_entry.async_on_unload(coordinator.async_add_listener(_async_add_new_devices))
+    _async_add_new_devices()
 
-        # Test the router is accessible.
-        data = self.get_aruba_data()
-        self.success_init = data is not None
 
+class ArubaScannerEntity(
+    CoordinatorEntity[ArubaDataUpdateCoordinator], ScannerEntity
+):
+    """Representation of a device connected to the Aruba Access Point."""
+
+    def __init__(
+        self, coordinator: ArubaDataUpdateCoordinator, mac_address: str
+    ) -> None:
+        """Initialize the tracked device."""
+        super().__init__(coordinator)
+        self._mac_address = mac_address
+        device = coordinator.data.get(mac_address, {})
+        self._attr_name = device.get("name") or mac_address
+
+    @property
     @override
-    def scan_devices(self) -> list[str]:
-        """Scan for new devices and return a list with found device IDs."""
-        self._update_info()
-        return [client["mac"] for client in self.last_results.values()]
+    def is_connected(self) -> bool:
+        """Return true if the device is connected to the Aruba Access Point."""
+        return self._mac_address in self.coordinator.data
 
+    @property
     @override
-    def get_device_name(self, device: str) -> str | None:
-        """Return the name of the given device or None if we don't know."""
-        if not self.last_results:
-            return None
-        for client in self.last_results.values():
-            if client["mac"] == device:
-                return client["name"]
+    def mac_address(self) -> str:
+        """Return the MAC address of the device."""
+        return self._mac_address
+
+    @property
+    @override
+    def ip_address(self) -> str | None:
+        """Return the IP address of the device."""
+        if device := self.coordinator.data.get(self._mac_address):
+            return device.get("ip")
         return None
 
-    def _update_info(self) -> bool:
-        """Ensure the information from the Aruba Access Point is up to date.
-
-        Return boolean if scanning successful.
-        """
-        if not self.success_init:
-            return False
-
-        if not (data := self.get_aruba_data()):
-            return False
-
-        self.last_results = data
-        return True
-
-    def get_aruba_data(self) -> dict[str, dict[str, str]] | None:
-        """Retrieve data from Aruba Access Point and return parsed result."""
-
-        connect = f"ssh {self.username}@{self.host}"
-        ssh: pexpect.spawn[str] = pexpect.spawn(connect, encoding="utf-8")
-        query = ssh.expect(
-            [
-                "password:",
-                pexpect.TIMEOUT,
-                pexpect.EOF,
-                "continue connecting (yes/no)?",
-                "Host key verification failed.",
-                "Connection refused",
-                "Connection timed out",
-            ],
-            timeout=120,
-        )
-        if query == 1:
-            _LOGGER.error("Timeout")
-            return None
-        if query == 2:
-            _LOGGER.error("Unexpected response from router")
-            return None
-        if query == 3:
-            ssh.sendline("yes")
-            ssh.expect("password:")
-        elif query == 4:
-            _LOGGER.error("Host key changed")
-            return None
-        elif query == 5:
-            _LOGGER.error("Connection refused by server")
-            return None
-        elif query == 6:
-            _LOGGER.error("Connection timed out")
-            return None
-        ssh.sendline(self.password)
-        ssh.expect("#")
-        ssh.sendline("show clients")
-        ssh.expect("#")
-        devices_result = (ssh.before or "").splitlines()
-        ssh.sendline("exit")
-
-        devices: dict[str, dict[str, str]] = {}
-        for device in devices_result:
-            if match := _DEVICES_REGEX.search(device):
-                devices[match.group("ip")] = {
-                    "ip": match.group("ip"),
-                    "mac": match.group("mac").upper(),
-                    "name": match.group("name"),
-                }
-        return devices
+    @property
+    @override
+    def hostname(self) -> str | None:
+        """Return the hostname of the device."""
+        if device := self.coordinator.data.get(self._mac_address):
+            return device.get("name")
+        return None

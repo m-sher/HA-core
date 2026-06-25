@@ -2,21 +2,24 @@
 
 from typing import override
 
-from quantum_gateway import QuantumGatewayScanner
-from requests.exceptions import RequestException
 import voluptuous as vol
 
 from homeassistant.components.device_tracker import (
-    DOMAIN as DEVICE_TRACKER_DOMAIN,
     PLATFORM_SCHEMA as DEVICE_TRACKER_PLATFORM_SCHEMA,
-    DeviceScanner,
+    AsyncSeeCallback,
+    ScannerEntity,
 )
+from homeassistant.config_entries import SOURCE_IMPORT
 from homeassistant.const import CONF_HOST, CONF_PASSWORD, CONF_SSL
-from homeassistant.core import HomeAssistant
-from homeassistant.helpers import config_validation as cv
-from homeassistant.helpers.typing import ConfigType
+from homeassistant.core import DOMAIN as HOMEASSISTANT_DOMAIN, HomeAssistant, callback
+from homeassistant.data_entry_flow import FlowResultType
+from homeassistant.helpers import config_validation as cv, issue_registry as ir
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
+from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
+from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .const import DEFAULT_HOST, LOGGER
+from .const import DEFAULT_HOST, DOMAIN
+from .coordinator import QuantumGatewayConfigEntry, QuantumGatewayDataUpdateCoordinator
 
 PLATFORM_SCHEMA = DEVICE_TRACKER_PLATFORM_SCHEMA.extend(
     {
@@ -27,49 +30,103 @@ PLATFORM_SCHEMA = DEVICE_TRACKER_PLATFORM_SCHEMA.extend(
 )
 
 
-def get_scanner(
-    hass: HomeAssistant, config: ConfigType
-) -> QuantumGatewayDeviceScanner | None:
-    """Validate the configuration and return a Quantum Gateway scanner."""
-    scanner = QuantumGatewayDeviceScanner(config[DEVICE_TRACKER_DOMAIN])
+async def async_setup_scanner(
+    hass: HomeAssistant,
+    config: ConfigType,
+    _async_see: AsyncSeeCallback,
+    _discovery_info: DiscoveryInfoType | None = None,
+) -> bool:
+    """Set up the legacy Quantum Gateway device tracker."""
+    import_data = {
+        CONF_HOST: config.get(CONF_HOST, DEFAULT_HOST),
+        CONF_PASSWORD: config[CONF_PASSWORD],
+        CONF_SSL: config.get(CONF_SSL, True),
+    }
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": SOURCE_IMPORT}, data=import_data
+    )
 
-    return scanner if scanner.success_init else None
+    if result["type"] is FlowResultType.ABORT and result["reason"] == "cannot_connect":
+        ir.async_create_issue(
+            hass,
+            DOMAIN,
+            "yaml_import_cannot_connect",
+            is_fixable=False,
+            issue_domain=DOMAIN,
+            severity=ir.IssueSeverity.ERROR,
+            translation_key="yaml_import_cannot_connect",
+            translation_placeholders={"host": import_data[CONF_HOST]},
+        )
+        return False
+
+    ir.async_delete_issue(hass, DOMAIN, "yaml_import_cannot_connect")
+    ir.async_create_issue(
+        hass,
+        HOMEASSISTANT_DOMAIN,
+        f"deprecated_yaml_{DOMAIN}",
+        is_fixable=False,
+        issue_domain=DOMAIN,
+        severity=ir.IssueSeverity.WARNING,
+        translation_key="deprecated_yaml",
+        translation_placeholders={
+            "domain": DOMAIN,
+            "integration_title": "Quantum Gateway",
+        },
+    )
+    return True
 
 
-class QuantumGatewayDeviceScanner(DeviceScanner):
-    """Class which queries a Quantum Gateway."""
+async def async_setup_entry(
+    hass: HomeAssistant,
+    config_entry: QuantumGatewayConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
+) -> None:
+    """Set up the Quantum Gateway device tracker from a config entry."""
+    coordinator = config_entry.runtime_data
+    tracked: set[str] = set()
 
-    def __init__(self, config) -> None:
-        """Initialize the scanner."""
+    @callback
+    def _async_add_new_devices() -> None:
+        """Add newly discovered devices from the coordinator."""
+        new_entities: list[QuantumGatewayScannerEntity] = []
+        for mac in coordinator.data:
+            if mac not in tracked:
+                tracked.add(mac)
+                new_entities.append(QuantumGatewayScannerEntity(coordinator, mac))
+        if new_entities:
+            async_add_entities(new_entities)
 
-        self.host = config[CONF_HOST]
-        self.password = config[CONF_PASSWORD]
-        self.use_https = config[CONF_SSL]
-        LOGGER.debug("Initializing")
+    config_entry.async_on_unload(coordinator.async_add_listener(_async_add_new_devices))
+    _async_add_new_devices()
 
-        try:
-            self.quantum = QuantumGatewayScanner(
-                self.host, self.password, self.use_https
-            )
-            self.success_init = self.quantum.success_init
-        except RequestException:
-            self.success_init = False
-            LOGGER.error("Unable to connect to gateway. Check host")
 
-        if not self.success_init:
-            LOGGER.error("Unable to login to gateway. Check password and host")
+class QuantumGatewayScannerEntity(
+    CoordinatorEntity[QuantumGatewayDataUpdateCoordinator], ScannerEntity
+):
+    """Representation of a device connected to the Quantum Gateway."""
 
+    def __init__(
+        self, coordinator: QuantumGatewayDataUpdateCoordinator, mac: str
+    ) -> None:
+        """Initialize the tracked device."""
+        super().__init__(coordinator)
+        self._mac = mac
+        self._attr_name = coordinator.data.get(mac) or mac
+
+    @property
     @override
-    def scan_devices(self):
-        """Scan for new devices and return a list of found MACs."""
-        connected_devices = []
-        try:
-            connected_devices = self.quantum.scan_devices()
-        except RequestException:
-            LOGGER.error("Unable to scan devices. Check connection to router")
-        return connected_devices
+    def is_connected(self) -> bool:
+        """Return true if the device is connected."""
+        return self._mac in self.coordinator.data
 
+    @property
     @override
-    def get_device_name(self, device):
-        """Return the name of the given device or None if we don't know."""
-        return self.quantum.get_device_name(device)
+    def mac_address(self) -> str:
+        """Return the MAC address of the device."""
+        return self._mac
+
+    @property
+    @override
+    def hostname(self) -> str | None:
+        """Return the hostname of the device."""
+        return self.coordinator.data.get(self._mac)

@@ -1,23 +1,26 @@
-"""Support for Arris TG2492LG router."""
+"""Support for Arris TG2492LG router device tracking using a coordinator."""
 
 from typing import override
 
-from aiohttp.client_exceptions import ClientResponseError
-from arris_tg2492lg import ConnectBox, Device
+from arris_tg2492lg import Device
 import voluptuous as vol
 
 from homeassistant.components.device_tracker import (
-    DOMAIN as DEVICE_TRACKER_DOMAIN,
     PLATFORM_SCHEMA as DEVICE_TRACKER_PLATFORM_SCHEMA,
-    DeviceScanner,
+    AsyncSeeCallback,
+    ScannerEntity,
 )
+from homeassistant.config_entries import SOURCE_IMPORT
 from homeassistant.const import CONF_HOST, CONF_PASSWORD
-from homeassistant.core import HomeAssistant
-from homeassistant.helpers import config_validation as cv
-from homeassistant.helpers.aiohttp_client import async_get_clientsession
-from homeassistant.helpers.typing import ConfigType
+from homeassistant.core import DOMAIN as HOMEASSISTANT_DOMAIN, HomeAssistant, callback
+from homeassistant.data_entry_flow import FlowResultType
+from homeassistant.helpers import config_validation as cv, issue_registry as ir
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
+from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
+from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-DEFAULT_HOST = "192.168.178.1"
+from .const import DEFAULT_HOST, DOMAIN
+from .coordinator import ArrisTg2492lgConfigEntry, ArrisTg2492lgDataUpdateCoordinator
 
 PLATFORM_SCHEMA = DEVICE_TRACKER_PLATFORM_SCHEMA.extend(
     {
@@ -27,56 +30,118 @@ PLATFORM_SCHEMA = DEVICE_TRACKER_PLATFORM_SCHEMA.extend(
 )
 
 
-async def async_get_scanner(
-    hass: HomeAssistant, config: ConfigType
-) -> ArrisDeviceScanner | None:
-    """Return the Arris device scanner if successful."""
-    conf = config[DEVICE_TRACKER_DOMAIN]
-    url = f"http://{conf[CONF_HOST]}"
-    websession = async_get_clientsession(hass)
-    connect_box = ConnectBox(websession, url, conf[CONF_PASSWORD])
+async def async_setup_scanner(
+    hass: HomeAssistant,
+    config: ConfigType,
+    _async_see: AsyncSeeCallback,
+    _discovery_info: DiscoveryInfoType | None = None,
+) -> bool:
+    """Set up the legacy Arris TG2492LG device tracker."""
+    import_data = {
+        CONF_HOST: config.get(CONF_HOST, DEFAULT_HOST),
+        CONF_PASSWORD: config[CONF_PASSWORD],
+    }
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": SOURCE_IMPORT}, data=import_data
+    )
 
-    try:
-        await connect_box.async_login()
+    if result["type"] is FlowResultType.ABORT and result["reason"] == "cannot_connect":
+        ir.async_create_issue(
+            hass,
+            DOMAIN,
+            "yaml_import_cannot_connect",
+            is_fixable=False,
+            issue_domain=DOMAIN,
+            severity=ir.IssueSeverity.ERROR,
+            translation_key="yaml_import_cannot_connect",
+            translation_placeholders={"host": import_data[CONF_HOST]},
+        )
+        return False
 
-        return ArrisDeviceScanner(connect_box)
-    except ClientResponseError:
+    ir.async_delete_issue(hass, DOMAIN, "yaml_import_cannot_connect")
+    ir.async_create_issue(
+        hass,
+        HOMEASSISTANT_DOMAIN,
+        f"deprecated_yaml_{DOMAIN}",
+        is_fixable=False,
+        issue_domain=DOMAIN,
+        severity=ir.IssueSeverity.WARNING,
+        translation_key="deprecated_yaml",
+        translation_placeholders={
+            "domain": DOMAIN,
+            "integration_title": "Arris TG2492LG",
+        },
+    )
+    return True
+
+
+async def async_setup_entry(
+    hass: HomeAssistant,
+    config_entry: ArrisTg2492lgConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
+) -> None:
+    """Set up the Arris TG2492LG device tracker from a config entry."""
+    coordinator = config_entry.runtime_data
+    tracked: set[str] = set()
+
+    @callback
+    def _async_add_new_devices() -> None:
+        """Add newly discovered devices from the coordinator."""
+        new_entities: list[ArrisTg2492lgScannerEntity] = []
+        for mac in coordinator.data:
+            if mac not in tracked:
+                tracked.add(mac)
+                new_entities.append(ArrisTg2492lgScannerEntity(coordinator, mac))
+        if new_entities:
+            async_add_entities(new_entities)
+
+    config_entry.async_on_unload(coordinator.async_add_listener(_async_add_new_devices))
+    _async_add_new_devices()
+
+
+class ArrisTg2492lgScannerEntity(
+    CoordinatorEntity[ArrisTg2492lgDataUpdateCoordinator], ScannerEntity
+):
+    """Representation of a device connected to the Arris TG2492LG router."""
+
+    def __init__(
+        self, coordinator: ArrisTg2492lgDataUpdateCoordinator, mac: str
+    ) -> None:
+        """Initialize the tracked device."""
+        super().__init__(coordinator)
+        self._mac = mac
+        device = coordinator.data.get(mac)
+        self._attr_name = (device.hostname if device else None) or mac
+
+    @property
+    def _device(self) -> Device | None:
+        """Return the current device data."""
+        return self.coordinator.data.get(self._mac)
+
+    @property
+    @override
+    def is_connected(self) -> bool:
+        """Return true if the device is connected to the router."""
+        return self._mac in self.coordinator.data
+
+    @property
+    @override
+    def mac_address(self) -> str:
+        """Return the MAC address of the device."""
+        return self._mac
+
+    @property
+    @override
+    def ip_address(self) -> str | None:
+        """Return the IP address of the device."""
+        if (device := self._device) is not None:
+            return device.ip
         return None
 
-
-class ArrisDeviceScanner(DeviceScanner):
-    """Class which queries a Arris TG2492LG router for connected devices."""
-
-    def __init__(self, connect_box: ConnectBox) -> None:
-        """Initialize the scanner."""
-        self.connect_box = connect_box
-        self.last_results: list[Device] = []
-
+    @property
     @override
-    async def async_scan_devices(self) -> list[str]:
-        """Scan for new devices and return a list with found device IDs."""
-        await self._async_update_info()
-
-        return [device.mac for device in self.last_results if device.mac]
-
-    @override
-    async def async_get_device_name(self, device: str) -> str | None:
-        """Return the name of the given device or None if we don't know."""
-        return next(
-            (result.hostname for result in self.last_results if result.mac == device),
-            None,
-        )
-
-    async def _async_update_info(self) -> None:
-        """Ensure the information from the Arris TG2492LG router is up to date."""
-        result = await self.connect_box.async_get_connected_devices()
-
-        last_results: list[Device] = []
-        mac_addresses: set[str | None] = set()
-
-        for device in result:
-            if device.online and device.mac not in mac_addresses:
-                last_results.append(device)
-                mac_addresses.add(device.mac)
-
-        self.last_results = last_results
+    def hostname(self) -> str | None:
+        """Return the hostname of the device."""
+        if (device := self._device) is not None:
+            return device.hostname
+        return None

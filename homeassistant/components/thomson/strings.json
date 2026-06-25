@@ -1,0 +1,26 @@
+{
+  "config": {
+    "abort": {
+      "already_configured": "[%key:common::config_flow::abort::already_configured_device%]",
+      "cannot_connect": "[%key:common::config_flow::error::cannot_connect%]"
+    },
+    "error": {
+      "cannot_connect": "[%key:common::config_flow::error::cannot_connect%]"
+    },
+    "step": {
+      "user": {
+        "data": {
+          "host": "[%key:common::config_flow::data::host%]",
+          "username": "[%key:common::config_flow::data::username%]",
+          "password": "[%key:common::config_flow::data::password%]"
+        }
+      }
+    }
+  },
+  "issues": {
+    "yaml_import_cannot_connect": {
+      "description": "The YAML configuration for Thomson at `{host}` could not be imported because the connection failed.\n\nPlease check that `{host}` is reachable and credentials are correct, update your `configuration.yaml` if needed, and restart Home Assistant.",
+      "title": "YAML configuration import failed: cannot connect"
+    }
+  }
+}

@@ -29,6 +29,7 @@ from miio import (
     RoborockVacuum,
     Timer,
     VacuumStatus,
+    WifiRepeater,
 )
 
 from homeassistant.const import CONF_DEVICE, CONF_HOST, CONF_MODEL, CONF_TOKEN, Platform
@@ -66,6 +67,7 @@ from .const import (
     MODELS_PURIFIER_MIOT,
     MODELS_SWITCH,
     MODELS_VACUUM,
+    MODELS_WIFI_REPEATER,
     ROBOROCK_GENERIC,
     ROCKROBO_GENERIC,
     AuthException,
@@ -113,6 +115,7 @@ VACUUM_PLATFORMS = [
     Platform.VACUUM,
 ]
 AIR_MONITOR_PLATFORMS = [Platform.AIR_QUALITY, Platform.SENSOR]
+WIFI_REPEATER_PLATFORMS = [Platform.DEVICE_TRACKER]
 
 MODEL_TO_CLASS_MAP = {
     MODEL_FAN_1C: Fan1C,
@@ -174,6 +177,8 @@ def get_platforms(config_entry):
         for air_monitor_model in MODELS_AIR_MONITOR:
             if model.startswith(air_monitor_model):
                 return AIR_MONITOR_PLATFORMS
+        if model in MODELS_WIFI_REPEATER:
+            return WIFI_REPEATER_PLATFORMS
     _LOGGER.error(
         (
             "Unsupported device found! Please create an issue at "
@@ -321,6 +326,7 @@ async def async_create_miio_device_and_coordinator(
         model not in MODELS_HUMIDIFIER
         and model not in MODELS_FAN
         and model not in MODELS_VACUUM
+        and model not in MODELS_WIFI_REPEATER
         and not model.startswith(ROBOROCK_GENERIC)
         and not model.startswith(ROCKROBO_GENERIC)
     ):
@@ -364,6 +370,9 @@ async def async_create_miio_device_and_coordinator(
         device = MODEL_TO_CLASS_MAP[model](host, token, lazy_discover=lazy_discover)
     elif model in MODELS_FAN_MIIO:
         device = Fan(host, token, lazy_discover=lazy_discover, model=model)
+    # WiFi Repeater
+    elif model in MODELS_WIFI_REPEATER:
+        device = WifiRepeater(host, token, lazy_discover=lazy_discover)
     else:
         _LOGGER.error(
             (
